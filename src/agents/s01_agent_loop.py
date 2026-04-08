@@ -14,6 +14,7 @@ This file teacher the smallest useful coding-agent pattern:
 It intentioanally is simple, but powerful.
 """
 
+import json
 import os
 import subprocess
 from dataclasses import dataclass
@@ -38,19 +39,32 @@ from dashscope import Generation
 dashscope.api_key = os.environ.get("DASHSCOPE_API_KEY")
 
 SYSTEM = (
-    f"You are a coding agent at {os.getcwd()}"
-    "Use bash to inspect and change the workspace. Act first, then report clearly what you did."
+    f"You are a coding agent in the workspace directory: {os.getcwd()}. "
+    "You have exactly one tool: `bash`. There is no write_file, edit_file, or apply_patch tool—do not mention or assume them. "
+    "To create or overwrite a file, call `bash` with a shell command such as: "
+    "`printf '%s\\n' 'line1' 'line2' > path.py`, or `cat <<'EOF' > path.py\\n...\\nEOF`. "
+    "Prefer running real commands over giving manual instructions. Act first, then summarize what you did."
 )
 
 TOOLS = [{
-    "name": "bash",
-    "description": "Run a bash command in current workspace.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "command": {"type": "string", "description": "The command to execute"},
+    "type": "function",
+    "function": {
+        "name": "bash",
+        "description": (
+            "Run one shell command in the current workspace (cwd is the project root). "
+            "This is the only way to read/write files: use redirection, heredocs, tee, etc. "
+            "Do not ask for a separate write_file tool—it does not exist."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "A single bash command (e.g. create a file: printf 'print(1)\\n' > hello.py)",
+                },
+            },
+            "required": ["command"],
         },
-        "required": ["command"],
     },
 }]
 
@@ -93,30 +107,71 @@ def run_bash(command: str) -> str:
 
 
 def extract_text(content) -> str:
+    if isinstance(content, str):
+        return content.strip()
     if not isinstance(content, list):
         return ""
-    text = []
+    parts = []
     for block in content:
-        text = getattr(block, "text", None)
-        if text:
-            text.append(text)
-    return "\n".join(text).strip()
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+        else:
+            t = getattr(block, "text", None)
+            if t:
+                parts.append(t)
+    return "\n".join(parts).strip()
 
-def execute_tool_calls(response_content) -> list[dict]:
+
+def _assistant_message_and_finish_reason(response) -> tuple[dict, str | None]:
+    """DashScope Generation uses response.output.choices[0], not .content / .stop_reason."""
+    out = response.output
+    if out is None:
+        raise ValueError("DashScope response has no output")
+    choices = out.get("choices")
+    if choices:
+        choice = choices[0]
+        msg = choice.get("message")
+        fr = choice.get("finish_reason")
+        return dict(msg), fr
+    text = out.get("text")
+    if text is not None:
+        return {"role": "assistant", "content": text}, out.get("finish_reason")
+    raise ValueError(f"Unexpected DashScope output shape: {out!r}")
+
+
+def _as_dict(obj) -> dict:
+    return dict(obj) if obj is not None and hasattr(obj, "keys") else obj
+
+
+def execute_tool_calls(tool_calls) -> list[dict]:
+    """Qwen/DashScope uses OpenAI-style tool_calls on the assistant message."""
     results = []
-    for block in response_content:
-        if block.type != "tool_use":
-            continue
-        command = block.input["command"]
-        print(f"\033[33m$ {command}\033[0m")
-        output = run_bash(command)
-        print(output[:200])
+    for tc in tool_calls:
+        tc = _as_dict(tc)
+        fn = _as_dict(tc.get("function"))
+        name = fn.get("name", "")
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+        except json.JSONDecodeError:
+            args = {}
+
+        if name != "bash":
+            out = f"Error: unknown tool {name!r}"
+        else:
+            command = args.get("command", "")
+            print(f"\033[33m$ {command}\033[0m")
+            out = run_bash(command)
+            print(out[:200])
+
         results.append({
-            "type": "tool_result",
-            "tool_use_id": block.id,
-            "content": output,
+            "role": "tool",
+            "tool_call_id": tc.get("id", ""),
+            "name": name,
+            "content": out,
         })
     return results
+
 
 def run_one_turn(state: LoopState) -> bool:
     response = Generation.call(
@@ -124,19 +179,29 @@ def run_one_turn(state: LoopState) -> bool:
         messages=state.messages,
         tools=TOOLS,
         max_tokens=8000,
+        result_format="message",
     )
-    state.messages.append({"role": "assistant", "content": response.content})
-
-    if response.stop_reason != "tool_use":
+    if response.status_code != 200:
+        err = f"[DashScope {response.code}] {response.message}"
+        print(err)
+        state.messages.append({"role": "assistant", "content": err})
         state.transition_reason = None
         return False
 
-    results = execute_tool_calls(response.content)
-    if not results:
+    assistant_msg, _finish_reason = _assistant_message_and_finish_reason(response)
+    state.messages.append(assistant_msg)
+
+    tool_calls = assistant_msg.get("tool_calls")
+    if not tool_calls:
         state.transition_reason = None
         return False
 
-    state.messages.append({"role": "user", "content": results})
+    tool_messages = execute_tool_calls(tool_calls)
+    if not tool_messages:
+        state.transition_reason = None
+        return False
+
+    state.messages.extend(tool_messages)
     state.turn_count += 1
     state.transition_reason = "tool_result"
     return True
@@ -146,7 +211,7 @@ def agent_loop(state: LoopState) -> None:
         pass
 
 if __name__ == "__main__":
-    history = []
+    history: list = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
             query = input("\033[36ms01 >> \033[0m")
