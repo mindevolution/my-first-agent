@@ -32,11 +32,55 @@ except ImportError:
     pass
 
 
+import requests
 import dashscope
 from dashscope import Generation
 
-# Auth (pick one)
+# International API host (use if your key is from Model Studio outside China, or TLS to China fails).
+_INTL_HTTP_BASE = "https://dashscope-intl.aliyuncs.com/api/v1"
+
+# Auth
 dashscope.api_key = os.environ.get("DASHSCOPE_API_KEY")
+
+# Endpoint: dashscope reads DASHSCOPE_HTTP_BASE_URL at import; override USE_INTL after import.
+if os.environ.get("DASHSCOPE_USE_INTL", "").strip().lower() in ("1", "true", "yes"):
+    dashscope.base_http_api_url = _INTL_HTTP_BASE.rstrip("/")
+elif _custom := os.environ.get("DASHSCOPE_HTTP_BASE_URL"):
+    dashscope.base_http_api_url = _custom.rstrip("/")
+
+
+def _dashscope_ssl_hint() -> None:
+    print(
+        "\033[31mDashScope TLS failed.\033[0m Use an endpoint that matches your API key, e.g.\n"
+        f"  export DASHSCOPE_HTTP_BASE_URL={_INTL_HTTP_BASE}\n"
+        "or  export DASHSCOPE_USE_INTL=1\n"
+        "China-region keys should use the default host; fix VPN/firewall if TLS still breaks."
+    )
+
+
+def _generation_call_with_tls_fallback(**call_kwargs):
+    try:
+        return Generation.call(**call_kwargs)
+    except requests.exceptions.SSLError:
+        base = (dashscope.base_http_api_url or "").lower()
+        if "intl" in base or os.environ.get("DASHSCOPE_DISABLE_TLS_FALLBACK", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            _dashscope_ssl_hint()
+            raise
+        print(
+            "\033[33mTLS to DashScope failed; retrying once on international endpoint "
+            f"({_INTL_HTTP_BASE}).\033[0m",
+            flush=True,
+        )
+        dashscope.base_http_api_url = _INTL_HTTP_BASE.rstrip("/")
+        try:
+            return Generation.call(**call_kwargs)
+        except requests.exceptions.SSLError:
+            _dashscope_ssl_hint()
+            raise
 
 SYSTEM = (
     f"You are a coding agent in the workspace directory: {os.getcwd()}. "
@@ -174,13 +218,17 @@ def execute_tool_calls(tool_calls) -> list[dict]:
 
 
 def run_one_turn(state: LoopState) -> bool:
-    response = Generation.call(
-        model="qwen-plus",  # or qwen-turbo, qwen-max, etc.
-        messages=state.messages,
-        tools=TOOLS,
-        max_tokens=8000,
-        result_format="message",
-    )
+    try:
+        response = _generation_call_with_tls_fallback(
+            model="qwen-plus",  # or qwen-turbo, qwen-max, etc.
+            messages=state.messages,
+            tools=TOOLS,
+            max_tokens=8000,
+            result_format="message",
+        )
+    except requests.exceptions.SSLError:
+        state.transition_reason = None
+        return False
     if response.status_code != 200:
         err = f"[DashScope {response.code}] {response.message}"
         print(err)
