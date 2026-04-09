@@ -235,6 +235,7 @@ def run_one_turn(state: LoopState) -> bool:
         state.messages.append({"role": "assistant", "content": err})
         state.transition_reason = None
         return False
+    print(response.output)
 
     assistant_msg, _finish_reason = _assistant_message_and_finish_reason(response)
     state.messages.append(assistant_msg)
