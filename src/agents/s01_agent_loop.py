@@ -17,6 +17,7 @@ It intentioanally is simple, but powerful.
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 
 try:
@@ -58,29 +59,105 @@ def _dashscope_ssl_hint() -> None:
     )
 
 
-def _generation_call_with_tls_fallback(**call_kwargs):
-    try:
-        return Generation.call(**call_kwargs)
-    except requests.exceptions.SSLError:
-        base = (dashscope.base_http_api_url or "").lower()
-        if "intl" in base or os.environ.get("DASHSCOPE_DISABLE_TLS_FALLBACK", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        ):
-            _dashscope_ssl_hint()
-            raise
-        print(
-            "\033[33mTLS to DashScope failed; retrying once on international endpoint "
-            f"({_INTL_HTTP_BASE}).\033[0m",
-            flush=True,
-        )
-        dashscope.base_http_api_url = _INTL_HTTP_BASE.rstrip("/")
+def _message_content_as_str(message) -> str:
+    if message is None:
+        return ""
+    m = dict(message) if hasattr(message, "keys") and not isinstance(message, dict) else message
+    if not isinstance(m, dict):
+        return ""
+    c = m.get("content")
+    if c is None:
+        return ""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts: list[str] = []
+        for item in c:
+            if isinstance(item, dict) and "text" in item:
+                parts.append(item.get("text") or "")
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts)
+    return str(c)
+
+
+def _tls_retry_switch_to_intl(already_retried: bool) -> bool:
+    """Return True if we switched endpoint and caller should retry. False = give up."""
+    if already_retried:
+        return False
+    base = (dashscope.base_http_api_url or "").lower()
+    if "intl" in base:
+        return False
+    if os.environ.get("DASHSCOPE_DISABLE_TLS_FALLBACK", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    print(
+        "\033[33mTLS to DashScope failed; retrying once on international endpoint "
+        f"({_INTL_HTTP_BASE}).\033[0m",
+        flush=True,
+    )
+    dashscope.base_http_api_url = _INTL_HTTP_BASE.rstrip("/")
+    return True
+
+
+def _stream_generation_to_stdout(**call_kwargs):
+    """
+    Stream assistant text to stdout. Uses stream=True and incremental_output=False so the
+    SDK merges chunks into cumulative snapshots; we print only the new suffix each time.
+    Returns the last GenerationResponse, or None on unrecoverable TLS / empty stream.
+    """
+    kwargs = dict(call_kwargs)
+    kwargs["stream"] = True
+    kwargs["incremental_output"] = True
+
+    prev_full = ""
+    last_rsp = None
+    tls_retried = False
+
+    while True:
         try:
-            return Generation.call(**call_kwargs)
+            gen = Generation.call(**kwargs)
         except requests.exceptions.SSLError:
+            if _tls_retry_switch_to_intl(tls_retried):
+                tls_retried = True
+                prev_full = ""
+                continue
             _dashscope_ssl_hint()
-            raise
+            return None
+
+        try:
+            for rsp in gen:
+                last_rsp = rsp
+                if rsp.status_code != 200:
+                    continue
+                out = rsp.output
+                if not out:
+                    continue
+                choices = out.get("choices")
+                if not choices:
+                    continue
+                msg = choices[0].get("message")
+                full = _message_content_as_str(msg)
+                if full.startswith(prev_full):
+                    delta = full[len(prev_full) :]
+                else:
+                    delta = full
+                if delta:
+                    sys.stdout.write(delta)
+                    sys.stdout.flush()
+                prev_full = full
+        except requests.exceptions.SSLError:
+            if _tls_retry_switch_to_intl(tls_retried):
+                tls_retried = True
+                prev_full = ""
+                continue
+            _dashscope_ssl_hint()
+            return None
+        break
+
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return last_rsp
+
 
 SYSTEM = (
     f"You are a coding agent in the workspace directory: {os.getcwd()}. "
@@ -218,15 +295,14 @@ def execute_tool_calls(tool_calls) -> list[dict]:
 
 
 def run_one_turn(state: LoopState) -> bool:
-    try:
-        response = _generation_call_with_tls_fallback(
-            model="qwen-plus",  # or qwen-turbo, qwen-max, etc.
-            messages=state.messages,
-            tools=TOOLS,
-            max_tokens=8000,
-            result_format="message",
-        )
-    except requests.exceptions.SSLError:
+    response = _stream_generation_to_stdout(
+        model="qwen-plus",  # or qwen-turbo, qwen-max, etc.
+        messages=state.messages,
+        tools=TOOLS,
+        max_tokens=8000,
+        result_format="message",
+    )
+    if response is None:
         state.transition_reason = None
         return False
     if response.status_code != 200:
@@ -235,7 +311,6 @@ def run_one_turn(state: LoopState) -> bool:
         state.messages.append({"role": "assistant", "content": err})
         state.transition_reason = None
         return False
-    print(response.output)
 
     assistant_msg, _finish_reason = _assistant_message_and_finish_reason(response)
     state.messages.append(assistant_msg)
@@ -272,8 +347,4 @@ if __name__ == "__main__":
         history.append({"role": "user", "content": query})
         state = LoopState(messages=history)
         agent_loop(state)
-
-        final_text = extract_text(history[-1]["content"])
-        if final_text:
-            print(final_text)
         print()
