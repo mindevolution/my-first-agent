@@ -238,16 +238,15 @@ Planning (required for multi-step work):
 - Keep exactly one `in_progress` at a time when multiple steps remain.
 - If the session plan block shows "No session plan yet", start by calling `todo` before bash/write_file/read_file/edit_file.
 
+For a **focused sub-investigation** in fresh context (e.g. "figure out which test framework we use"), call `run_subtask` with a clear `prompt`. The subagent only has bash/read_file/write_file/edit_file and returns a text summary.
+
 Prefer tools over long prose; use bash/write_file/read_file/edit_file to change the workspace."""
 
-SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
-
-TOOL_HANDLERS = {
-        "bash":       lambda **kw: run_bash(kw["command"]),
-        "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
-        "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-        "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    }
+SUBAGENT_SYSTEM = (
+    f"You are a coding subagent at {WORKDIR}. "
+    "You only have bash, read_file, write_file, and edit_file. "
+    "Use tools to complete the task, then reply with a concise summary for the parent agent."
+)
 
 class AgentTemplate:
     """
@@ -368,27 +367,6 @@ CHILD_TOOLS = [{
 },
 ]
 
-# -- Subagent: fresh context, filtered tools, summary-only return --
-def run_subagent(prompt: str) -> str:
-    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
-    for _ in range(30):  # safety limit
-        response = Generation.call(
-            model="qwen-plus", system=SUBAGENT_SYSTEM, messages=sub_messages,
-            tools=CHILD_TOOLS, result_format="message",
-        )
-        sub_messages.append({"role": "assistant", "content": response.output})
-        if response.stop_reason != "tool_use":
-            break
-        results = []
-        for block in response.output:
-            if block.get("type") == "tool_use":
-                handler = TOOL_HANDLERS.get(block.get("name"))
-                output = handler(**block.get("arguments")) if handler else f"Unknown tool: {block.get('name')}"
-                results.append({"type": "tool_result", "tool_use_id": block.get("id"), "content": str(output)[:50000]})
-        sub_messages.append({"role": "user", "content": results})
-    # Only the final text returns to the parent -- child context is discarded
-    return "".join(b.get("content") for b in response.output if b.get("content")) or "(no summary)"
-
 PARENT_TOOLS = CHILD_TOOLS + [{
     "type": "function",
     "function": {
@@ -426,6 +404,32 @@ PARENT_TOOLS = CHILD_TOOLS + [{
                 }
             },
             "required": ["items"],
+        },
+    },
+},
+{
+    "type": "function",
+    "function": {
+        "name": "run_subtask",
+        "description": (
+            "Run a sub-investigation in a fresh context (no parent chat history). "
+            "The subagent has bash, read_file, write_file, edit_file only—no todo. "
+            "Use for isolated questions (e.g. detect test framework, scan one directory). "
+            "Returns a text summary to incorporate into your answer."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Specific task for the subagent (what to find or do).",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Short label for logs (optional).",
+                },
+            },
+            "required": ["prompt"],
         },
     },
 }]
@@ -614,6 +618,16 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
+# Handlers for the subagent only (no todo / run_subtask — avoids recursion).
+SUBAGENT_TOOL_HANDLERS = {
+    "bash":       lambda **kw: run_bash(kw["command"]),
+    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+}
+
+
 def build_tool_handlers(todo: TodoManager) -> dict:
     return {
         "bash":       lambda **kw: run_bash(kw["command"]),
@@ -621,6 +635,7 @@ def build_tool_handlers(todo: TodoManager) -> dict:
         "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
         "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
         "todo":       lambda **kw: todo.update(kw["items"]),
+        "run_subtask": lambda **kw: invoke_run_subtask(**kw),
     }
 
 
@@ -749,6 +764,9 @@ def execute_tool_calls(
                     ev["path"] = args.get("path", "")
                 elif name == "todo":
                     ev["items"] = len(args.get("items") or [])
+                elif name == "run_subtask":
+                    ev["title"] = (args.get("title") or "")[:80]
+                    ev["prompt_preview"] = (args.get("prompt") or "")[:200]
                 ev["output_preview"] = (out or "")[:800]
                 events.append(ev)
             else:
@@ -766,6 +784,9 @@ def execute_tool_calls(
                 elif name == "todo":
                     nitems = len(args.get("items") or [])
                     print(f"\033[33mtodo\033[0m ({nitems} items)")
+                elif name == "run_subtask":
+                    t = (args.get("title") or "").strip() or "subtask"
+                    print(f"\033[36mrun_subtask\033[0m [{t}]")
                 clip = (out or "")[:200]
                 if clip:
                     print(clip)
@@ -777,6 +798,64 @@ def execute_tool_calls(
             "content": out if isinstance(out, str) else str(out),
         })
     return results
+
+
+SUBAGENT_MAX_TURNS = 24
+
+
+def invoke_run_subtask(**kw) -> str:
+    prompt = (kw.get("prompt") or "").strip()
+    if not prompt:
+        return "Error: run_subtask requires a non-empty prompt"
+    title = (kw.get("title") or "").strip()
+    return run_subagent(prompt, title=title)
+
+
+def run_subagent(prompt: str, title: str = "") -> str:
+    """
+    Inner agent loop using DashScope message + tool_calls (same shape as the parent).
+    Fresh messages; only CHILD_TOOLS; context is discarded after return.
+    """
+    label = title or "subtask"
+    sub_messages: list = [
+        {"role": "system", "content": SUBAGENT_SYSTEM},
+        {"role": "user", "content": prompt},
+    ]
+    handlers = SUBAGENT_TOOL_HANDLERS
+    last_text = ""
+    print(f"\033[36m--- subagent: {label} ---\033[0m")
+    for turn in range(SUBAGENT_MAX_TURNS):
+        response = _call_generation_nonstream(
+            model="qwen-plus",
+            messages=sub_messages,
+            tools=CHILD_TOOLS,
+            max_tokens=6000,
+            result_format="message",
+        )
+        if response is None:
+            print(f"\033[31m[{label}] no API response\033[0m")
+            return f"[{label}] Subagent error: no response from API"
+        if response.status_code != 200:
+            err = f"{response.code} {getattr(response, 'message', '')}"
+            print(f"\033[31m[{label}] {err}\033[0m")
+            return f"[{label}] Subagent API error: {err}"
+
+        assistant_msg, finish_reason = _assistant_message_and_finish_reason(response)
+        assistant_msg = _normalize_assistant_message_for_dashscope(assistant_msg)
+        last_text = _message_content_as_str(assistant_msg)
+        logger.info("Subagent turn %s finish_reason=%s", turn, finish_reason)
+        sub_messages.append(assistant_msg)
+
+        tool_calls = assistant_msg.get("tool_calls")
+        if not tool_calls:
+            print(f"\033[36m--- end subagent: {label} ---\033[0m")
+            return last_text if last_text.strip() else "(subagent returned no text)"
+
+        tool_results = execute_tool_calls(tool_calls, handlers, events=None)
+        sub_messages.extend(tool_results)
+
+    print(f"\033[33m[{label}] subagent max turns ({SUBAGENT_MAX_TURNS})\033[0m")
+    return (last_text or "") + f"\n...[subagent stopped after {SUBAGENT_MAX_TURNS} tool rounds]"
 
 
 def _log_llm_response(response) -> None:

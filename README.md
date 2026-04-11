@@ -19,6 +19,7 @@ Agent refactor (CLI + API):
 LoopState.todo — per-run TodoManager (replaces global TODO).
 build_tool_handlers(todo) / execute_tool_calls(..., handlers, events=...) — tool dispatch + optional event list for the UI.
 _call_generation_nonstream — one-shot Generation.call (no stdout); run_one_turn(state, events=None) uses it.
+run_subtask tool — delegates to run_subagent() (DashScope message/tool loop, CHILD_TOOLS only); todo stays separate.
 CLI still prints assistant text and tool lines when events is None.
 Serve:
 python src/agents/s04_subagent.py serve → http://127.0.0.1:8765
