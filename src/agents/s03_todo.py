@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # Harness: the loop -- keep feeding real tool results back into the model.
 """
-s02_tool_use.py - Tool Use Agent.
+s03_todo.py - Todo Agent.
 
-This file demonstrates agent tool use with bash, read_file, write_file, and edit_file tools.
+This file demonstrates agent planning with the todo tool for multi-step work.
 
     user message
-        -> model reply with tool calls
-        -> execute tools
-        -> write tool results back to messages
-        -> repeat
+        -> model reply with todo plan
+        -> update plan state
+        -> continue execution
 
 It is intentionally simple, but powerful.
 """
@@ -18,7 +17,7 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
@@ -207,13 +206,10 @@ def _generation_to_stdout(**call_kwargs):
     return _stream_generation_to_stdout(**kwargs)
 
 
-SYSTEM = (
-    f"You are a coding agent in the workspace directory: {os.getcwd()}. "
-    "You have tools: bash, read_file, write_file, edit_file. "
-    "To create or overwrite a file you MUST call write_file(path, content)—do not only say you will create it. "
-    "Use read_file to read files, edit_file to replace a unique snippet, bash for commands. "
-    "Call tools instead of narrating; after tool results, give a short summary."
-)
+SYSTEM = f"""You are a coding agent at {WORKDIR}.
+Use the todo tool for multi-step work.
+Keep exactly one step in_progress when a task has multiple steps.
+Refresh the plan as work advances. Prefer tools over prose."""
 
 TOOLS = [{
     "type": "function",
@@ -311,6 +307,85 @@ def safe_path(p: str) -> Path:
     return path
 
 @dataclass
+class PlanItem:
+    content: str
+    status: str = "pending"
+    active_form: str = ""
+
+
+@dataclass
+class PlanningState:
+    items: list[PlanItem] = field(default_factory=list)
+    rounds_since_update: int = 0
+
+class TodoManager:
+    def __init__(self):
+        self.state = PlanningState()
+
+    def update(self, items: list) -> str:
+        if len(items) > 12:
+            raise ValueError("Keep the session plan short (max 12 items)")
+
+        normalized = []
+        in_progress_count = 0
+        for index, raw_item in enumerate(items):
+            content = str(raw_item.get("content", "")).strip()
+            status = str(raw_item.get("status", "pending")).lower()
+            active_form = str(raw_item.get("activeForm", "")).strip()
+
+            if not content:
+                raise ValueError(f"Item {index}: content required")
+            if status not in {"pending", "in_progress", "completed"}:
+                raise ValueError(f"Item {index}: invalid status '{status}'")
+            if status == "in_progress":
+                in_progress_count += 1
+
+            normalized.append(PlanItem(
+                content=content,
+                status=status,
+                active_form=active_form,
+            ))
+
+        if in_progress_count > 1:
+            raise ValueError("Only one plan item can be in_progress")
+
+        self.state.items = normalized
+        self.state.rounds_since_update = 0
+        return self.render()
+
+    def note_round_without_update(self) -> None:
+        self.state.rounds_since_update += 1
+
+    def reminder(self) -> str | None:
+        if not self.state.items:
+            return None
+        if self.state.rounds_since_update < PLAN_REMINDER_INTERVAL:
+            return None
+        return "<reminder>Refresh your current plan before continuing.</reminder>"
+
+    def render(self) -> str:
+        if not self.state.items:
+            return "No session plan yet."
+
+        lines = []
+        for item in self.state.items:
+            marker = {
+                "pending": "[ ]",
+                "in_progress": "[>]",
+                "completed": "[x]",
+            }[item.status]
+            line = f"{marker} {item.content}"
+            if item.status == "in_progress" and item.active_form:
+                line += f" ({item.active_form})"
+            lines.append(line)
+
+        completed = sum(1 for item in self.state.items if item.status == "completed")
+        lines.append(f"\n({completed}/{len(self.state.items)} completed)")
+        return "\n".join(lines)
+
+TODO = TodoManager()
+
+@dataclass
 class LoopState:
     messages: list
     turn_count: int = 1
@@ -371,6 +446,7 @@ TOOL_HANDLERS = {
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"],
                                         kw["new_text"]),
+    "todo": lambda **kw: TODO.update(kw["items"]),
 }
 
 

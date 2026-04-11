@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # Harness: the loop -- keep feeding real tool results back into the model.
 """
-s01-the-agent-loop.py - The Agent Loop.
+s01_agent_loop.py - The Agent Loop.
 
-This file teacher the smallest useful coding-agent pattern:
+This file teaches the smallest useful coding-agent pattern:
 
     user message
         -> model reply
@@ -11,7 +11,7 @@ This file teacher the smallest useful coding-agent pattern:
         -> write tool_result back to messages
         -> repeat
 
-It intentioanally is simple, but powerful.
+It is intentionally simple, but powerful.
 """
 
 import json
