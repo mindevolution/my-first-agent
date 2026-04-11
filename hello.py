@@ -1,12 +1,6 @@
-"""A simple hello world module.
-
-This module demonstrates basic Python practices including
-type hints, docstrings, and the main guard pattern.
-"""
-
-
 def say_hello(name: str = "World") -> str:
-    """Return a greeting message for the given name.
+    """
+    Say hello to a given name.
 
     Args:
         name: The name to greet. Defaults to "World".
@@ -18,11 +12,11 @@ def say_hello(name: str = "World") -> str:
 
 
 def main() -> None:
-    """Main entry point of the program.
-
-    Prints a greeting message to the console.
+    """
+    Main function to demonstrate the say_hello function.
     """
     print(say_hello())
+    print(say_hello("Alice"))
 
 
 if __name__ == "__main__":

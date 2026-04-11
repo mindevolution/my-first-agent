@@ -14,6 +14,7 @@ It is intentionally simple, but powerful.
 """
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -37,10 +38,13 @@ import requests
 import dashscope
 from dashscope import Generation
 
+logger = logging.getLogger(__name__)
+
 # International API host (use if your key is from Model Studio outside China, or TLS to China fails).
 _INTL_HTTP_BASE = "https://dashscope-intl.aliyuncs.com/api/v1"
 
 WORKDIR = Path.cwd()
+PLAN_REMINDER_INTERVAL = 3
 
 # Auth
 dashscope.api_key = os.environ.get("DASHSCOPE_API_KEY")
@@ -298,6 +302,44 @@ TOOLS = [{
         },
     },
 },
+{
+    "type": "function",
+    "function": {
+        "name": "todo",
+        "description": "Rewrite the current session plan for multi-step work.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "A description of the task to perform."
+                            },
+                            "status": {
+                                "type": "string",
+                                "description": "The status of the task.",
+                                "enum": ["pending", "in_progress", "completed"]
+                            },
+                            "activeForm": {
+                                "type": "string",
+                                "description": "Optional present-continuous label.",
+                                "default": ""
+                            }
+                        },
+                        "required": ["content", "status"]
+                    },
+                    "description": "List of TODO items (tasks) to accomplish a larger goal."
+                }
+            },
+            "required": ["items"]
+        }
+    }
+},
+
 ]
 
 def safe_path(p: str) -> Path:
@@ -579,6 +621,37 @@ def execute_tool_calls(tool_calls) -> list[dict]:
     return results
 
 
+def _log_llm_response(response) -> None:
+    """Log one DashScope Generation round (success, API error, or missing response)."""
+    if response is None:
+        logger.warning("LLM response: None (no response from Generation.call)")
+        return
+
+    record: dict = {
+        "status_code": getattr(response, "status_code", None),
+        "code": getattr(response, "code", None),
+        "message": getattr(response, "message", None),
+        "request_id": getattr(response, "request_id", None),
+    }
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        record["usage"] = (
+            dict(usage) if hasattr(usage, "keys") and not isinstance(usage, dict) else usage
+        )
+
+    if getattr(response, "status_code", None) == 200 and response.output is not None:
+        try:
+            msg, finish_reason = _assistant_message_and_finish_reason(response)
+            content = _message_content_as_str(msg)
+            record["finish_reason"] = finish_reason
+            record["assistant_content"] = content[:8000] + ("..." if len(content) > 8000 else "")
+            record["tool_calls"] = msg.get("tool_calls")
+        except Exception as e:
+            record["assistant_parse_error"] = str(e)
+
+    logger.info("LLM response: %s", json.dumps(record, ensure_ascii=False, default=str))
+
+
 def run_one_turn(state: LoopState) -> bool:
     response = _generation_to_stdout(
         model="qwen-plus",  # or qwen-turbo, qwen-max, etc.
@@ -587,6 +660,7 @@ def run_one_turn(state: LoopState) -> bool:
         max_tokens=8000,
         result_format="message",
     )
+    _log_llm_response(response)
     if response is None:
         state.transition_reason = None
         return False
@@ -602,9 +676,22 @@ def run_one_turn(state: LoopState) -> bool:
     state.messages.append(assistant_msg)
 
     tool_calls = assistant_msg.get("tool_calls")
+    used_todo = False
     if not tool_calls:
         state.transition_reason = None
         return False
+    for tc in tool_calls:
+        if tc.get("name") == "todo":
+            used_todo = True
+            break
+
+    if used_todo:
+        TODO.state.rounds_since_update = 0
+    else:
+        TODO.note_round_without_update()
+        reminder = TODO.reminder()
+        if reminder:
+            state.messages.insert(0, {"role": "user", "content": reminder})
 
     tool_messages = execute_tool_calls(tool_calls)
     if not tool_messages:
@@ -628,10 +715,22 @@ def agent_loop(state: LoopState) -> None:
             break
 
 if __name__ == "__main__":
+    _logs_dir = WORKDIR / "logs"
+    _logs_dir.mkdir(parents=True, exist_ok=True)
+    _log_path = _logs_dir / "s03_todo.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stderr),
+            logging.FileHandler(_log_path, encoding="utf-8"),
+        ],
+        force=True,
+    )
     history: list = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
-            query = input("\033[36ms01 >> \033[0m")
+            query = input("\033[36ms03 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
