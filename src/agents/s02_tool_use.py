@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 try:
     import readline
@@ -39,6 +40,8 @@ from dashscope import Generation
 
 # International API host (use if your key is from Model Studio outside China, or TLS to China fails).
 _INTL_HTTP_BASE = "https://dashscope-intl.aliyuncs.com/api/v1"
+
+WORKDIR = Path.cwd()
 
 # Auth
 dashscope.api_key = os.environ.get("DASHSCOPE_API_KEY")
@@ -164,9 +167,10 @@ def _generation_to_stdout(**call_kwargs):
     Print assistant text and return the final GenerationResponse.
 
     When ``tools`` are passed, uses ``stream=False``. DashScope streams tool calls as
-    deltas merged by the SDK: ``function.name`` / ``arguments`` are built across chunks,
-    and empty ``tool_call`` ``id`` values are common—non-streaming returns a complete
-    tool_calls payload in one response.
+    deltas merged by the SDK (see ``dashscope.utils.message_utils.merge_single_response``):
+    ``function.name`` / ``arguments`` are string-concatenated across chunks, and fields
+    with empty values are skipped—so you can see empty ``id``, missing ``name``, or
+    truncated ``arguments``. A single non-stream response avoids that class of bugs.
     """
     kwargs = dict(call_kwargs)
     if kwargs.get("tools"):
@@ -205,10 +209,10 @@ def _generation_to_stdout(**call_kwargs):
 
 SYSTEM = (
     f"You are a coding agent in the workspace directory: {os.getcwd()}. "
-    "You have exactly one tool: `bash`. There is no write_file, edit_file, or apply_patch tool—do not mention or assume them. "
-    "To create or overwrite a file, call `bash` with a shell command such as: "
-    "`printf '%s\\n' 'line1' 'line2' > path.py`, or `cat <<'EOF' > path.py\\n...\\nEOF`. "
-    "Prefer running real commands over giving manual instructions. Act first, then summarize what you did."
+    "You have tools: bash, read_file, write_file, edit_file. "
+    "To create or overwrite a file you MUST call write_file(path, content)—do not only say you will create it. "
+    "Use read_file to read files, edit_file to replace a unique snippet, bash for commands. "
+    "Call tools instead of narrating; after tool results, give a short summary."
 )
 
 TOOLS = [{
@@ -217,8 +221,7 @@ TOOLS = [{
         "name": "bash",
         "description": (
             "Run one shell command in the current workspace (cwd is the project root). "
-            "This is the only way to read/write files: use redirection, heredocs, tee, etc. "
-            "Do not ask for a separate write_file tool—it does not exist."
+            "Prefer write_file/read_file/edit_file for file content; use bash for builds, git, etc."
         ),
         "parameters": {
             "type": "object",
@@ -231,17 +234,81 @@ TOOLS = [{
             "required": ["command"],
         },
     },
-}]
+},
+{
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": "Read a file and return the content.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The path to the file to read.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "The maximum number of lines to read.",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+},
+{
+    "type": "function",
+    "function": {
+        "name": "write_file",
+        "description": "Write to a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The path to the file to write to.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The content to write to the file.",
+                },
+            },
+            "required": ["path", "content"],
+        },
+    },
+},
+{
+    "type": "function",
+    "function": {
+        "name": "edit_file",
+        "description": "Edit a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The path to the file to edit.",
+                },
+                "old_text": {
+                    "type": "string",
+                    "description": "The text to replace.",  
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "The text to replace with.",
+                },
+            },
+            "required": ["path", "old_text", "new_text"],
+        },
+    },
+},
+]
 
-# response = Generation.call(
-#     model="qwen-plus",  # or qwen-turbo, qwen-max, etc.
-#     messages=[
-#         {"role": "system", "content": "You are a helpful assistant."},
-#         {"role": "user", "content": "Hello."},
-#     ],
-#     result_format="message",
-# )
-# print(response.output)
+def safe_path(p: str) -> Path:
+    path = (WORKDIR / p).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {p}")
+    return path
 
 @dataclass
 class LoopState:
@@ -269,6 +336,42 @@ def run_bash(command: str) -> str:
 
     output = (result.stdout + result.stderr).strip()
     return output[:50000] if output else "No output."
+
+def run_read(path: str, limit: int = None) -> str:
+    text = safe_path(path).read_text()
+    lines = text.splitlines()
+    if limit and limit < len(lines):
+        lines = lines[:limit]
+    return "\n".join(lines)[:50000]  # hard cap to avoid blowing up the context
+
+def run_write(path: str, content: str) -> str:
+    try:
+        fp = safe_path(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content)
+        return f"Wrote {len(content)} bytes to {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def run_edit(path: str, old_text: str, new_text: str) -> str:
+    try:
+        fp = safe_path(path)
+        content = fp.read_text()
+        if old_text not in content:
+            return f"Error: Text not found in {path}"
+        fp.write_text(content.replace(old_text, new_text, 1))
+        return f"Edited {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+TOOL_HANDLERS = {
+    "bash":       lambda **kw: run_bash(kw["command"]),
+    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"],
+                                        kw["new_text"]),
+}
 
 
 def extract_text(content) -> str:
@@ -308,6 +411,51 @@ def _as_dict(obj) -> dict:
     return dict(obj) if obj is not None and hasattr(obj, "keys") else obj
 
 
+def _tool_arguments_json_for_api(raw) -> str:
+    """DashScope requires function.arguments to be a string of valid JSON (object)."""
+    if raw is None:
+        return "{}"
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return "{}"
+        try:
+            parsed = json.loads(s)
+        except json.JSONDecodeError:
+            return "{}"
+    else:
+        parsed = raw
+    if not isinstance(parsed, dict):
+        return "{}"
+    return json.dumps(parsed, ensure_ascii=False)
+
+
+def _normalize_assistant_message_for_dashscope(msg: dict) -> dict:
+    """
+    Normalize tool_calls for replay: arguments must be non-empty valid JSON objects.
+    Model output may be partial, Python-ish, or non-object JSON — coerce to "{}" or dumps(dict).
+    """
+    msg = dict(msg)
+    tcs = msg.get("tool_calls")
+    if not tcs:
+        return msg
+    fixed: list[dict] = []
+    for tc in tcs:
+        tc = _as_dict(tc)
+        if not isinstance(tc, dict):
+            continue
+        fn = _as_dict(tc.get("function"))
+        if not isinstance(fn, dict):
+            fn = {"name": "", "arguments": "{}"}
+        fn["arguments"] = _tool_arguments_json_for_api(fn.get("arguments"))
+        if "name" not in fn:
+            fn["name"] = ""
+        tc["function"] = fn
+        fixed.append(tc)
+    msg["tool_calls"] = fixed
+    return msg
+
+
 def execute_tool_calls(tool_calls) -> list[dict]:
     """Qwen/DashScope uses OpenAI-style tool_calls on the assistant message."""
     results = []
@@ -321,19 +469,36 @@ def execute_tool_calls(tool_calls) -> list[dict]:
         except json.JSONDecodeError:
             args = {}
 
-        if name != "bash":
+        handler = TOOL_HANDLERS.get(name)
+        if handler is None:
             out = f"Error: unknown tool {name!r}"
         else:
-            command = args.get("command", "")
-            print(f"\033[33m$ {command}\033[0m")
-            out = run_bash(command)
-            print(out[:200])
+            try:
+                out = handler(**args)
+            except TypeError as e:
+                out = f"Error: invalid arguments for {name!r}: {e}"
+            except ValueError as e:
+                out = f"Error: {e}"
+            except Exception as e:
+                out = f"Error: {e}"
+
+            if name == "bash":
+                print(f"\033[33m$ {args.get('command', '')}\033[0m")
+            elif name == "write_file":
+                print(f"\033[33mwrite_file\033[0m {args.get('path', '')!r} ({len(args.get('content') or '')} bytes)")
+            elif name == "read_file":
+                print(f"\033[33mread_file\033[0m {args.get('path', '')!r}")
+            elif name == "edit_file":
+                print(f"\033[33medit_file\033[0m {args.get('path', '')!r}")
+            clip = (out or "")[:200]
+            if clip:
+                print(clip)
 
         results.append({
             "role": "tool",
             "tool_call_id": tc.get("id", ""),
             "name": name,
-            "content": out,
+            "content": out if isinstance(out, str) else str(out),
         })
     return results
 
@@ -357,6 +522,7 @@ def run_one_turn(state: LoopState) -> bool:
         return False
 
     assistant_msg, _finish_reason = _assistant_message_and_finish_reason(response)
+    assistant_msg = _normalize_assistant_message_for_dashscope(assistant_msg)
     state.messages.append(assistant_msg)
 
     tool_calls = assistant_msg.get("tool_calls")
@@ -374,9 +540,16 @@ def run_one_turn(state: LoopState) -> bool:
     state.transition_reason = "tool_result"
     return True
 
+MAX_TOOL_ROUNDS = 32
+
+
 def agent_loop(state: LoopState) -> None:
+    rounds = 0
     while run_one_turn(state):
-        pass
+        rounds += 1
+        if rounds >= MAX_TOOL_ROUNDS:
+            print("\033[33mAgent stopped: max tool rounds reached.\033[0m")
+            break
 
 if __name__ == "__main__":
     history: list = [{"role": "system", "content": SYSTEM}]
