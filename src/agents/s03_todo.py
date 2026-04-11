@@ -211,11 +211,56 @@ def _generation_to_stdout(**call_kwargs):
 
 
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Use the todo tool for multi-step work.
-Keep exactly one step in_progress when a task has multiple steps.
-Refresh the plan as work advances. Prefer tools over prose."""
+
+Planning (required for multi-step work):
+- If the user asks for anything that needs more than one tool call or more than one file/command, you MUST call `todo` first in that turn. Build a short checklist: one item `in_progress`, others `pending`.
+- After each substantive step (file written, command run, etc.), call `todo` again to mark completed items and move `in_progress` to the next pending item.
+- Keep exactly one `in_progress` at a time when multiple steps remain.
+- If the session plan block shows "No session plan yet", start by calling `todo` before bash/write_file/read_file/edit_file.
+
+Prefer tools over long prose; use bash/write_file/read_file/edit_file to change the workspace."""
 
 TOOLS = [{
+    "type": "function",
+    "function": {
+        "name": "todo",
+        "description": (
+            "Update the session task list. Call at the start of multi-step work and after each major step. "
+            "Pass the full list each time (replace prior plan). Exactly one item should be in_progress until all done."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "A description of the task to perform.",
+                            },
+                            "status": {
+                                "type": "string",
+                                "description": "The status of the task.",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                            "activeForm": {
+                                "type": "string",
+                                "description": "Optional present-continuous label for the in-progress item.",
+                                "default": "",
+                            },
+                        },
+                        "required": ["content", "status"],
+                    },
+                    "description": "Full list of tasks for this session turn (replaces previous plan).",
+                }
+            },
+            "required": ["items"],
+        },
+    },
+},
+{
     "type": "function",
     "function": {
         "name": "bash",
@@ -302,43 +347,6 @@ TOOLS = [{
         },
     },
 },
-{
-    "type": "function",
-    "function": {
-        "name": "todo",
-        "description": "Rewrite the current session plan for multi-step work.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "content": {
-                                "type": "string",
-                                "description": "A description of the task to perform."
-                            },
-                            "status": {
-                                "type": "string",
-                                "description": "The status of the task.",
-                                "enum": ["pending", "in_progress", "completed"]
-                            },
-                            "activeForm": {
-                                "type": "string",
-                                "description": "Optional present-continuous label.",
-                                "default": ""
-                            }
-                        },
-                        "required": ["content", "status"]
-                    },
-                    "description": "List of TODO items (tasks) to accomplish a larger goal."
-                }
-            },
-            "required": ["items"]
-        }
-    }
-},
 
 ]
 
@@ -362,6 +370,10 @@ class PlanningState:
 
 class TodoManager:
     def __init__(self):
+        self.state = PlanningState()
+
+    def reset(self) -> None:
+        """Clear plan for a new user query."""
         self.state = PlanningState()
 
     def update(self, items: list) -> str:
@@ -403,7 +415,10 @@ class TodoManager:
             return None
         if self.state.rounds_since_update < PLAN_REMINDER_INTERVAL:
             return None
-        return "<reminder>Refresh your current plan before continuing.</reminder>"
+        return (
+            "<reminder>You have an active session plan but have not called `todo` for several tool rounds. "
+            "Call `todo` now to refresh statuses (mark completed, set next in_progress) before other tools.</reminder>"
+        )
 
     def render(self) -> str:
         if not self.state.items:
@@ -426,6 +441,45 @@ class TodoManager:
         return "\n".join(lines)
 
 TODO = TodoManager()
+
+
+def _tool_names_in_assistant_calls(tool_calls) -> set[str]:
+    """OpenAI-style assistant tool_calls carry the name under function.name, not top-level."""
+    names: set[str] = set()
+    if not tool_calls:
+        return names
+    for tc in tool_calls:
+        tc = _as_dict(tc)
+        if not isinstance(tc, dict):
+            continue
+        fn = _as_dict(tc.get("function"))
+        n = (fn.get("name") or "").strip()
+        if n:
+            names.add(n)
+    return names
+
+
+def _messages_for_llm(messages: list) -> list:
+    """Copy messages and inject live plan after the system message (not stored in state.messages)."""
+    if not messages:
+        return []
+    out: list = []
+    inserted = False
+    for m in messages:
+        out.append(m)
+        if not inserted and m.get("role") == "system":
+            out.append({
+                "role": "user",
+                "content": f"<session_plan>\n{TODO.render()}\n</session_plan>",
+            })
+            inserted = True
+    if not inserted:
+        out.insert(0, {
+            "role": "user",
+            "content": f"<session_plan>\n{TODO.render()}\n</session_plan>",
+        })
+    return out
+
 
 @dataclass
 class LoopState:
@@ -608,6 +662,9 @@ def execute_tool_calls(tool_calls) -> list[dict]:
                 print(f"\033[33mread_file\033[0m {args.get('path', '')!r}")
             elif name == "edit_file":
                 print(f"\033[33medit_file\033[0m {args.get('path', '')!r}")
+            elif name == "todo":
+                nitems = len(args.get("items") or [])
+                print(f"\033[33mtodo\033[0m ({nitems} items)")
             clip = (out or "")[:200]
             if clip:
                 print(clip)
@@ -655,7 +712,7 @@ def _log_llm_response(response) -> None:
 def run_one_turn(state: LoopState) -> bool:
     response = _generation_to_stdout(
         model="qwen-plus",  # or qwen-turbo, qwen-max, etc.
-        messages=state.messages,
+        messages=_messages_for_llm(state.messages),
         tools=TOOLS,
         max_tokens=8000,
         result_format="message",
@@ -676,22 +733,16 @@ def run_one_turn(state: LoopState) -> bool:
     state.messages.append(assistant_msg)
 
     tool_calls = assistant_msg.get("tool_calls")
-    used_todo = False
     if not tool_calls:
         state.transition_reason = None
         return False
-    for tc in tool_calls:
-        if tc.get("name") == "todo":
-            used_todo = True
-            break
 
+    tool_names = _tool_names_in_assistant_calls(tool_calls)
+    used_todo = "todo" in tool_names
     if used_todo:
         TODO.state.rounds_since_update = 0
     else:
         TODO.note_round_without_update()
-        reminder = TODO.reminder()
-        if reminder:
-            state.messages.insert(0, {"role": "user", "content": reminder})
 
     tool_messages = execute_tool_calls(tool_calls)
     if not tool_messages:
@@ -699,6 +750,10 @@ def run_one_turn(state: LoopState) -> bool:
         return False
 
     state.messages.extend(tool_messages)
+    if not used_todo:
+        reminder = TODO.reminder()
+        if reminder:
+            state.messages.append({"role": "user", "content": reminder})
     state.turn_count += 1
     state.transition_reason = "tool_result"
     return True
@@ -737,6 +792,7 @@ if __name__ == "__main__":
             break
 
         history.append({"role": "user", "content": query})
+        TODO.reset()
         state = LoopState(messages=history)
         agent_loop(state)
         print()
