@@ -1,0 +1,14 @@
+# API stack for s04_subagent (FastAPI + Uvicorn).
+# Install pydantic before fastapi so the resolver does not backtrack forever.
+#
+# If you see "No matching distribution found for pydantic":
+#   - Use the real PyPI index (mirrors can be incomplete or out of sync):
+#       pip install -r requirements-api.txt -i https://pypi.org/simple
+#   - Or combine Tsinghua + PyPI:
+#       pip install -r requirements-api.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --extra-index-url https://pypi.org/simple
+#   - Use Python 3.10–3.13 (3.14 may lack wheels until packages catch up).
+#   - Upgrade pip: python -m pip install -U pip
+
+pydantic>=2.10.4,<3
+fastapi>=0.115.0,<0.116.0
+uvicorn[standard]>=0.32.0,<0.33.0

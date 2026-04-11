@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # Harness: the loop -- keep feeding real tool results back into the model.
 """
-s03_todo.py - Todo Agent.
-
-This file demonstrates agent planning with the todo tool for multi-step work.
+s04_subagent.py — Todo coding agent (CLI, HTTP API, or `python ... serve`).
 
     user message
         -> model reply with todo plan
         -> update plan state
         -> continue execution
 
-It is intentionally simple, but powerful.
+Also exposes a FastAPI app (`app`) for a Vite React UI.
 """
 
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -210,6 +209,27 @@ def _generation_to_stdout(**call_kwargs):
     return _stream_generation_to_stdout(**kwargs)
 
 
+def _call_generation_nonstream(**call_kwargs):
+    """
+    Same contract as the tools branch of _generation_to_stdout, but no stdout.
+    Used by run_one_turn (always non-stream when tools are present).
+    """
+    kwargs = dict(call_kwargs)
+    kwargs["stream"] = False
+    kwargs.pop("incremental_output", None)
+    tls_retried = False
+    while True:
+        try:
+            rsp = Generation.call(**kwargs)
+        except requests.exceptions.SSLError:
+            if _tls_retry_switch_to_intl(tls_retried):
+                tls_retried = True
+                continue
+            _dashscope_ssl_hint()
+            return None
+        return rsp
+
+
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 
 Planning (required for multi-step work):
@@ -220,47 +240,46 @@ Planning (required for multi-step work):
 
 Prefer tools over long prose; use bash/write_file/read_file/edit_file to change the workspace."""
 
-TOOLS = [{
-    "type": "function",
-    "function": {
-        "name": "todo",
-        "description": (
-            "Update the session task list. Call at the start of multi-step work and after each major step. "
-            "Pass the full list each time (replace prior plan). Exactly one item should be in_progress until all done."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "content": {
-                                "type": "string",
-                                "description": "A description of the task to perform.",
-                            },
-                            "status": {
-                                "type": "string",
-                                "description": "The status of the task.",
-                                "enum": ["pending", "in_progress", "completed"],
-                            },
-                            "activeForm": {
-                                "type": "string",
-                                "description": "Optional present-continuous label for the in-progress item.",
-                                "default": "",
-                            },
-                        },
-                        "required": ["content", "status"],
-                    },
-                    "description": "Full list of tasks for this session turn (replaces previous plan).",
-                }
-            },
-            "required": ["items"],
-        },
-    },
-},
-{
+SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
+
+TOOL_HANDLERS = {
+        "bash":       lambda **kw: run_bash(kw["command"]),
+        "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+        "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+        "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    }
+
+class AgentTemplate:
+    """
+    Parse agent definition from markdown frontmatter.
+
+    Real Claude Code loads agent definitions from .claude/agents/*.md.
+    Frontmatter fields: name, tools, disallowedTools, skills, hooks,
+    model, effort, permissionMode, maxTurns, memory, isolation, color,
+    background, initialPrompt, mcpServers.
+    3 sources: built-in, custom (.claude/agents/), plugin-provided.
+    """
+    def __init__(self, path):
+        self.path = Path(path)
+        self.name = self.path.stem
+        self.config = {}
+        self.system_prompt = ""
+        self._parse()
+
+    def _parse(self):
+        text = self.path.read_text()
+        match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)", text, re.DOTALL)
+        if not match:
+            self.system_prompt = text
+            return
+        for line in match.group(1).splitlines():
+            if ":" in line:
+                k, _, v = line.partition(":")
+                self.config[k.strip()] = v.strip()
+        self.system_prompt = match.group(2).strip()
+        self.name = self.config.get("name", self.name)
+
+CHILD_TOOLS = [{
     "type": "function",
     "function": {
         "name": "bash",
@@ -347,8 +366,69 @@ TOOLS = [{
         },
     },
 },
-
 ]
+
+# -- Subagent: fresh context, filtered tools, summary-only return --
+def run_subagent(prompt: str) -> str:
+    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
+    for _ in range(30):  # safety limit
+        response = Generation.call(
+            model="qwen-plus", system=SUBAGENT_SYSTEM, messages=sub_messages,
+            tools=CHILD_TOOLS, result_format="message",
+        )
+        sub_messages.append({"role": "assistant", "content": response.output})
+        if response.stop_reason != "tool_use":
+            break
+        results = []
+        for block in response.output:
+            if block.get("type") == "tool_use":
+                handler = TOOL_HANDLERS.get(block.get("name"))
+                output = handler(**block.get("arguments")) if handler else f"Unknown tool: {block.get('name')}"
+                results.append({"type": "tool_result", "tool_use_id": block.get("id"), "content": str(output)[:50000]})
+        sub_messages.append({"role": "user", "content": results})
+    # Only the final text returns to the parent -- child context is discarded
+    return "".join(b.get("content") for b in response.output if b.get("content")) or "(no summary)"
+
+PARENT_TOOLS = CHILD_TOOLS + [{
+    "type": "function",
+    "function": {
+        "name": "todo",
+        "description": (
+            "Update the session task list. Call at the start of multi-step work and after each major step. "
+            "Pass the full list each time (replace prior plan). Exactly one item should be in_progress until all done."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "A description of the task to perform.",
+                            },
+                            "status": {
+                                "type": "string",
+                                "description": "The status of the task.",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                            "activeForm": {
+                                "type": "string",
+                                "description": "Optional present-continuous label for the in-progress item.",
+                                "default": "",
+                            },
+                        },
+                        "required": ["content", "status"],
+                    },
+                    "description": "Full list of tasks for this session turn (replaces previous plan).",
+                }
+            },
+            "required": ["items"],
+        },
+    },
+}]
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -440,9 +520,6 @@ class TodoManager:
         lines.append(f"\n({completed}/{len(self.state.items)} completed)")
         return "\n".join(lines)
 
-TODO = TodoManager()
-
-
 def _tool_names_in_assistant_calls(tool_calls) -> set[str]:
     """OpenAI-style assistant tool_calls carry the name under function.name, not top-level."""
     names: set[str] = set()
@@ -459,7 +536,7 @@ def _tool_names_in_assistant_calls(tool_calls) -> set[str]:
     return names
 
 
-def _messages_for_llm(messages: list) -> list:
+def _messages_for_llm(messages: list, todo: TodoManager) -> list:
     """Copy messages and inject live plan after the system message (not stored in state.messages)."""
     if not messages:
         return []
@@ -470,13 +547,13 @@ def _messages_for_llm(messages: list) -> list:
         if not inserted and m.get("role") == "system":
             out.append({
                 "role": "user",
-                "content": f"<session_plan>\n{TODO.render()}\n</session_plan>",
+                "content": f"<session_plan>\n{todo.render()}\n</session_plan>",
             })
             inserted = True
     if not inserted:
         out.insert(0, {
             "role": "user",
-            "content": f"<session_plan>\n{TODO.render()}\n</session_plan>",
+            "content": f"<session_plan>\n{todo.render()}\n</session_plan>",
         })
     return out
 
@@ -486,6 +563,7 @@ class LoopState:
     messages: list
     turn_count: int = 1
     transition_reason: str | None = None
+    todo: TodoManager = field(default_factory=TodoManager)
 
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
@@ -536,14 +614,14 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-TOOL_HANDLERS = {
-    "bash":       lambda **kw: run_bash(kw["command"]),
-    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"],
-                                        kw["new_text"]),
-    "todo": lambda **kw: TODO.update(kw["items"]),
-}
+def build_tool_handlers(todo: TodoManager) -> dict:
+    return {
+        "bash":       lambda **kw: run_bash(kw["command"]),
+        "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+        "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+        "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+        "todo":       lambda **kw: todo.update(kw["items"]),
+    }
 
 
 def extract_text(content) -> str:
@@ -628,7 +706,11 @@ def _normalize_assistant_message_for_dashscope(msg: dict) -> dict:
     return msg
 
 
-def execute_tool_calls(tool_calls) -> list[dict]:
+def execute_tool_calls(
+    tool_calls,
+    handlers: dict,
+    events: list | None = None,
+) -> list[dict]:
     """Qwen/DashScope uses OpenAI-style tool_calls on the assistant message."""
     results = []
     for tc in tool_calls:
@@ -641,7 +723,7 @@ def execute_tool_calls(tool_calls) -> list[dict]:
         except json.JSONDecodeError:
             args = {}
 
-        handler = TOOL_HANDLERS.get(name)
+        handler = handlers.get(name)
         if handler is None:
             out = f"Error: unknown tool {name!r}"
         else:
@@ -654,20 +736,39 @@ def execute_tool_calls(tool_calls) -> list[dict]:
             except Exception as e:
                 out = f"Error: {e}"
 
-            if name == "bash":
-                print(f"\033[33m$ {args.get('command', '')}\033[0m")
-            elif name == "write_file":
-                print(f"\033[33mwrite_file\033[0m {args.get('path', '')!r} ({len(args.get('content') or '')} bytes)")
-            elif name == "read_file":
-                print(f"\033[33mread_file\033[0m {args.get('path', '')!r}")
-            elif name == "edit_file":
-                print(f"\033[33medit_file\033[0m {args.get('path', '')!r}")
-            elif name == "todo":
-                nitems = len(args.get("items") or [])
-                print(f"\033[33mtodo\033[0m ({nitems} items)")
-            clip = (out or "")[:200]
-            if clip:
-                print(clip)
+            if events is not None:
+                ev: dict = {"type": "tool", "name": name}
+                if name == "bash":
+                    ev["command"] = args.get("command", "")
+                elif name == "write_file":
+                    ev["path"] = args.get("path", "")
+                    ev["bytes"] = len(args.get("content") or "")
+                elif name == "read_file":
+                    ev["path"] = args.get("path", "")
+                elif name == "edit_file":
+                    ev["path"] = args.get("path", "")
+                elif name == "todo":
+                    ev["items"] = len(args.get("items") or [])
+                ev["output_preview"] = (out or "")[:800]
+                events.append(ev)
+            else:
+                if name == "bash":
+                    print(f"\033[33m$ {args.get('command', '')}\033[0m")
+                elif name == "write_file":
+                    print(
+                        f"\033[33mwrite_file\033[0m {args.get('path', '')!r} "
+                        f"({len(args.get('content') or '')} bytes)"
+                    )
+                elif name == "read_file":
+                    print(f"\033[33mread_file\033[0m {args.get('path', '')!r}")
+                elif name == "edit_file":
+                    print(f"\033[33medit_file\033[0m {args.get('path', '')!r}")
+                elif name == "todo":
+                    nitems = len(args.get("items") or [])
+                    print(f"\033[33mtodo\033[0m ({nitems} items)")
+                clip = (out or "")[:200]
+                if clip:
+                    print(clip)
 
         results.append({
             "role": "tool",
@@ -709,27 +810,45 @@ def _log_llm_response(response) -> None:
     logger.info("LLM response: %s", json.dumps(record, ensure_ascii=False, default=str))
 
 
-def run_one_turn(state: LoopState) -> bool:
-    response = _generation_to_stdout(
+def run_one_turn(state: LoopState, events: list | None = None) -> bool:
+    handlers = build_tool_handlers(state.todo)
+    response = _call_generation_nonstream(
         model="qwen-plus",  # or qwen-turbo, qwen-max, etc.
-        messages=_messages_for_llm(state.messages),
-        tools=TOOLS,
+        messages=_messages_for_llm(state.messages, state.todo),
+        tools=PARENT_TOOLS,
         max_tokens=8000,
         result_format="message",
     )
     _log_llm_response(response)
     if response is None:
         state.transition_reason = None
+        if events is not None:
+            events.append({"type": "error", "message": "No response from model (TLS or empty)."})
         return False
     if response.status_code != 200:
         err = f"[DashScope {response.code}] {response.message}"
-        print(err)
+        if events is not None:
+            events.append({"type": "error", "message": err})
+        else:
+            print(err)
         state.messages.append({"role": "assistant", "content": err})
         state.transition_reason = None
         return False
 
-    assistant_msg, _finish_reason = _assistant_message_and_finish_reason(response)
+    assistant_msg, finish_reason = _assistant_message_and_finish_reason(response)
     assistant_msg = _normalize_assistant_message_for_dashscope(assistant_msg)
+    text = _message_content_as_str(assistant_msg)
+    if events is not None:
+        events.append({
+            "type": "assistant",
+            "content": text,
+            "finish_reason": finish_reason,
+            "tool_calls": assistant_msg.get("tool_calls"),
+        })
+    elif text:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+
     state.messages.append(assistant_msg)
 
     tool_calls = assistant_msg.get("tool_calls")
@@ -740,18 +859,18 @@ def run_one_turn(state: LoopState) -> bool:
     tool_names = _tool_names_in_assistant_calls(tool_calls)
     used_todo = "todo" in tool_names
     if used_todo:
-        TODO.state.rounds_since_update = 0
+        state.todo.state.rounds_since_update = 0
     else:
-        TODO.note_round_without_update()
+        state.todo.note_round_without_update()
 
-    tool_messages = execute_tool_calls(tool_calls)
+    tool_messages = execute_tool_calls(tool_calls, handlers, events=events)
     if not tool_messages:
         state.transition_reason = None
         return False
 
     state.messages.extend(tool_messages)
     if not used_todo:
-        reminder = TODO.reminder()
+        reminder = state.todo.reminder()
         if reminder:
             state.messages.append({"role": "user", "content": reminder})
     state.turn_count += 1
@@ -761,18 +880,116 @@ def run_one_turn(state: LoopState) -> bool:
 MAX_TOOL_ROUNDS = 32
 
 
-def agent_loop(state: LoopState) -> None:
+def agent_loop(state: LoopState, events: list | None = None) -> None:
     rounds = 0
-    while run_one_turn(state):
+    while run_one_turn(state, events=events):
         rounds += 1
         if rounds >= MAX_TOOL_ROUNDS:
-            print("\033[33mAgent stopped: max tool rounds reached.\033[0m")
+            msg = "Agent stopped: max tool rounds reached."
+            if events is not None:
+                events.append({"type": "warning", "message": msg})
+            else:
+                print(f"\033[33m{msg}\033[0m")
             break
 
+def _serialize_messages_for_api(messages: list, tool_cap: int = 4000) -> list[dict]:
+    out: list[dict] = []
+    for m in messages:
+        row = dict(m) if isinstance(m, dict) else dict(m)
+        role = row.get("role")
+        content = row.get("content")
+        if role == "tool" and isinstance(content, str) and len(content) > tool_cap:
+            row = {**row, "content": content[:tool_cap] + "...[truncated]"}
+        if row.get("tool_calls"):
+            row = {
+                **row,
+                "tool_calls": json.loads(json.dumps(row["tool_calls"], default=str)),
+            }
+        out.append(row)
+    return out
+
+
+# --- HTTP API (FastAPI; optional — pip install fastapi uvicorn) --------
+
+app = None
+_api_sessions: dict[str, list] = {}
+
+try:
+    import uuid as _uuid
+
+    from fastapi import FastAPI as _FastAPI
+    from fastapi import HTTPException as _HTTPException
+    from fastapi.middleware.cors import CORSMiddleware as _CORSMiddleware
+    from pydantic import BaseModel as _BaseModel
+    from pydantic import Field as _Field
+
+    class _ChatRequest(_BaseModel):
+        message: str = _Field(..., min_length=1)
+        session_id: str | None = None
+
+    class _ChatResponse(_BaseModel):
+        session_id: str
+        events: list
+        messages: list
+        plan: str
+
+    app = _FastAPI(title="s04_subagent", version="1.0.0")
+    app.add_middleware(
+        _CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/api/health")
+    def _api_health():
+        return {"ok": True, "workspace": str(WORKDIR)}
+
+    @app.post("/api/chat", response_model=_ChatResponse)
+    def _api_chat(body: _ChatRequest):
+        if not (os.environ.get("DASHSCOPE_API_KEY") or "").strip():
+            raise _HTTPException(status_code=503, detail="DASHSCOPE_API_KEY is not set")
+        sid = body.session_id or str(_uuid.uuid4())
+        if sid not in _api_sessions:
+            _api_sessions[sid] = [{"role": "system", "content": SYSTEM}]
+        msgs = _api_sessions[sid]
+        msgs.append({"role": "user", "content": body.message.strip()})
+        state = LoopState(messages=msgs)
+        events: list = []
+        agent_loop(state, events=events)
+        return _ChatResponse(
+            session_id=sid,
+            events=events,
+            messages=_serialize_messages_for_api(msgs),
+            plan=state.todo.render(),
+        )
+
+    @app.delete("/api/sessions/{session_id}")
+    def _api_delete_session(session_id: str):
+        _api_sessions.pop(session_id, None)
+        return {"ok": True}
+
+except ImportError:
+    pass
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        if app is None:
+            print(
+                "FastAPI is not installed. Run: pip install fastapi 'uvicorn[standard]'",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        import uvicorn
+
+        uvicorn.run(app, host="127.0.0.1", port=8765)
+        raise SystemExit(0)
+
     _logs_dir = WORKDIR / "logs"
     _logs_dir.mkdir(parents=True, exist_ok=True)
-    _log_path = _logs_dir / "s03_todo.log"
+    _log_path = _logs_dir / "s04_subagent.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -785,14 +1002,13 @@ if __name__ == "__main__":
     history: list = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
-            query = input("\033[36ms03 >> \033[0m")
+            query = input("\033[36ms04 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
 
         history.append({"role": "user", "content": query})
-        TODO.reset()
         state = LoopState(messages=history)
         agent_loop(state)
         print()
