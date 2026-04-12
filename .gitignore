@@ -87,6 +87,10 @@ poetry.lock
 # Local history for IDEs
 .localhistory/
 
+# Runtime / agent logs (written by local scripts)
+logs/
+*.log
+
 # macOS
 .DS_Store
 

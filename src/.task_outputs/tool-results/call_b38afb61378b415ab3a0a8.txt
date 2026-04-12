@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-import time
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -32,16 +31,9 @@ logger = logging.getLogger(__name__)
 # International API host (use if your key is from Model Studio outside China, or TLS to China fails).
 _INTL_HTTP_BASE = "https://dashscope-intl.aliyuncs.com/api/v1"
 
-LLM_MODEL = "qwen-plus"
 WORKDIR = Path.cwd()
 PLAN_REMINDER_INTERVAL = 3
 SKILLS_DIR = WORKDIR / "src/skills"
-CONTEXT_LIMIT = 50000
-KEEP_RECENT_TOOL_RESULTS = 3
-PERSIST_THRESHOLD = 30000
-PREVIEW_CHARS = 2000
-TRANSCRIPT_DIR = WORKDIR / "src/.transcripts"
-TOOL_RESULTS_DIR = WORKDIR / "src/.task_outputs" / "tool-results"
 
 # Auth
 dashscope.api_key = os.environ.get("DASHSCOPE_API_KEY")
@@ -118,66 +110,15 @@ class SkillRegistry:
 
 SKILL_REGISTRY = SkillRegistry(SKILLS_DIR)
 
-@dataclass
-class CompactState:
-    has_compacted: bool = False
-    last_summary: str = ""
-    recent_files: list[str] = field(default_factory=list)
 
 
-def estimate_context_size(messages: list) -> int:
-    return len(str(messages))
-
-
-def track_recent_file(state: CompactState, path: str) -> None:
-    if path in state.recent_files:
-        state.recent_files.remove(path)
-    state.recent_files.append(path)
-    if len(state.recent_files) > 5:
-        state.recent_files[:] = state.recent_files[-5:]
-
-def persist_large_output(tool_use_id: str, output: str) -> str:
-    if len(output) <= PERSIST_THRESHOLD:
-        return output
-
-    TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    stored_path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
-    if not stored_path.exists():
-        stored_path.write_text(output)
-
-    preview = output[:PREVIEW_CHARS]
-    rel_path = stored_path.relative_to(WORKDIR)
-    return (
-        "<persisted-output>\n"
-        f"Full output saved to: {rel_path}\n"
-        "Preview:\n"
-        f"{preview}\n"
-        "</persisted-output>"
+def _dashscope_ssl_hint() -> None:
+    print(
+        "\033[31mDashScope TLS failed.\033[0m Use an endpoint that matches your API key, e.g.\n"
+        f"  export DASHSCOPE_HTTP_BASE_URL={_INTL_HTTP_BASE}\n"
+        "or  export DASHSCOPE_USE_INTL=1\n"
+        "China-region keys should use the default host; fix VPN/firewall if TLS still breaks."
     )
-
-def collect_tool_result_blocks(messages: list) -> list[tuple[int, int, dict]]:
-    blocks = []
-    for message_index, message in enumerate(messages):
-        content = message.get("content")
-        if message.get("role") != "user" or not isinstance(content, list):
-            continue
-        for block_index, block in enumerate(content):
-            if isinstance(block, dict) and block.get("type") == "tool_result":
-                blocks.append((message_index, block_index, block))
-    return blocks
-
-
-def micro_compact(messages: list) -> list:
-    tool_results = collect_tool_result_blocks(messages)
-    if len(tool_results) <= KEEP_RECENT_TOOL_RESULTS:
-        return messages
-
-    for _, _, block in tool_results[:-KEEP_RECENT_TOOL_RESULTS]:
-        content = block.get("content", "")
-        if not isinstance(content, str) or len(content) <= 120:
-            continue
-        block["content"] = "[Earlier tool result compacted. Re-run the tool if you need full detail.]"
-    return messages
 
 
 def _message_content_as_str(message) -> str:
@@ -200,177 +141,6 @@ def _message_content_as_str(message) -> str:
                 parts.append(item)
         return "".join(parts)
     return str(c)
-
-
-def _tool_names_for_llm_log(tools) -> list[str]:
-    if not tools:
-        return []
-    names: list[str] = []
-    for item in tools:
-        d = item if isinstance(item, dict) else None
-        if d is None and item is not None and hasattr(item, "keys"):
-            try:
-                d = dict(item)
-            except Exception:
-                continue
-        if not isinstance(d, dict):
-            continue
-        fn = d.get("function")
-        if not isinstance(fn, dict) and fn is not None and hasattr(fn, "keys"):
-            try:
-                fn = dict(fn)
-            except Exception:
-                fn = {}
-        if isinstance(fn, dict):
-            n = fn.get("name")
-            if n:
-                names.append(n)
-    return names
-
-
-def _messages_detail_for_llm_log(messages) -> list[dict]:
-    rows: list[dict] = []
-    if not messages:
-        return rows
-    cap = PREVIEW_CHARS
-    for raw in messages:
-        d = raw if isinstance(raw, dict) else None
-        if d is None and raw is not None and hasattr(raw, "keys"):
-            try:
-                d = dict(raw)
-            except Exception:
-                rows.append({
-                    "role": "?",
-                    "content_chars": 0,
-                    "content_preview": "(unserializable message)",
-                })
-                continue
-        if not isinstance(d, dict):
-            rows.append({
-                "role": "?",
-                "content_chars": 0,
-                "content_preview": "(non-dict message)",
-            })
-            continue
-        role = d.get("role", "")
-        text = _message_content_as_str(d)
-        prev = text[:cap] + ("..." if len(text) > cap else "")
-        row: dict = {"role": role, "content_chars": len(text), "content_preview": prev}
-        tcs = d.get("tool_calls")
-        if tcs:
-            tnames: list[str] = []
-            for tc in tcs:
-                tcd = tc if isinstance(tc, dict) else None
-                if tcd is None and tc is not None and hasattr(tc, "keys"):
-                    try:
-                        tcd = dict(tc)
-                    except Exception:
-                        continue
-                if not isinstance(tcd, dict):
-                    continue
-                fn = tcd.get("function")
-                if not isinstance(fn, dict) and fn is not None and hasattr(fn, "keys"):
-                    try:
-                        fn = dict(fn)
-                    except Exception:
-                        fn = {}
-                if isinstance(fn, dict):
-                    n = fn.get("name")
-                    if n:
-                        tnames.append(n)
-            if tnames:
-                row["assistant_tool_names"] = tnames
-        if role == "tool":
-            row["tool_call_id"] = d.get("tool_call_id")
-            row["tool_name"] = d.get("name")
-        rows.append(row)
-    return rows
-
-
-def _log_llm_request(kwargs: dict, *, context: str | None = None) -> None:
-    """Log outbound Generation.call: model, tools, and per-message content previews."""
-    msgs = kwargs.get("messages") or []
-    msg_rows = _messages_detail_for_llm_log(msgs)
-    record = {
-        "context": context,
-        "model": kwargs.get("model"),
-        "max_tokens": kwargs.get("max_tokens"),
-        "result_format": kwargs.get("result_format"),
-        "stream": kwargs.get("stream"),
-        "incremental_output": kwargs.get("incremental_output"),
-        "temperature": kwargs.get("temperature"),
-        "tool_names": _tool_names_for_llm_log(kwargs.get("tools")),
-        "message_count": len(msgs),
-        "total_content_chars": sum(r.get("content_chars", 0) for r in msg_rows),
-        "messages": msg_rows,
-    }
-    logger.info("LLM request: %s", json.dumps(record, ensure_ascii=False, default=str))
-
-
-def write_transcript(messages: list) -> Path:
-    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-    path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with path.open("w") as handle:
-        for message in messages:
-            handle.write(json.dumps(message, default=str) + "\n")
-    return path
-
-
-def summarize_history(messages: list) -> str:
-    conversation = json.dumps(messages, default=str)[:80000]
-    prompt = (
-        "Summarize this coding-agent conversation so work can continue.\n"
-        "Preserve:\n"
-        "1. The current goal\n"
-        "2. Important findings and decisions\n"
-        "3. Files read or changed\n"
-        "4. Remaining work\n"
-        "5. User constraints and preferences\n"
-        "Be compact but concrete.\n\n"
-        f"{conversation}"
-    )
-    _compact_kw = {
-        "model": LLM_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 2000,
-        "result_format": "message",
-    }
-    _log_llm_request(_compact_kw, context="compact_summary")
-    response = Generation.call(**_compact_kw)
-    return response.output.choices[0].message.content.strip()
-
-
-def compact_history(messages: list, state: CompactState, focus: str | None = None) -> list:
-    transcript_path = write_transcript(messages)
-    print(f"[transcript saved: {transcript_path}]")
-
-    summary = summarize_history(messages)
-    if focus:
-        summary += f"\n\nFocus to preserve next: {focus}"
-    if state.recent_files:
-        recent_lines = "\n".join(f"- {path}" for path in state.recent_files)
-        summary += f"\n\nRecent files to reopen if needed:\n{recent_lines}"
-
-    state.has_compacted = True
-    state.last_summary = summary
-
-    return [{
-        "role": "user",
-        "content": (
-            "This conversation was compacted so the agent can continue working.\n\n"
-            f"{summary}"
-        ),
-    }]
-
-
-
-def _dashscope_ssl_hint() -> None:
-    print(
-        "\033[31mDashScope TLS failed.\033[0m Use an endpoint that matches your API key, e.g.\n"
-        f"  export DASHSCOPE_HTTP_BASE_URL={_INTL_HTTP_BASE}\n"
-        "or  export DASHSCOPE_USE_INTL=1\n"
-        "China-region keys should use the default host; fix VPN/firewall if TLS still breaks."
-    )
 
 
 def _tls_retry_switch_to_intl(already_retried: bool) -> bool:
@@ -400,7 +170,6 @@ def _stream_generation_to_stdout(**call_kwargs):
     kwargs = dict(call_kwargs)
     kwargs["stream"] = True
     kwargs["incremental_output"] = True
-    log_ctx = kwargs.pop("_llm_log_context", None)
 
     prev_full = ""
     last_rsp = None
@@ -408,7 +177,6 @@ def _stream_generation_to_stdout(**call_kwargs):
 
     while True:
         try:
-            _log_llm_request(kwargs, context=log_ctx)
             gen = Generation.call(**kwargs)
         except requests.exceptions.SSLError:
             if _tls_retry_switch_to_intl(tls_retried):
@@ -467,11 +235,9 @@ def _generation_to_stdout(**call_kwargs):
     if kwargs.get("tools"):
         kwargs["stream"] = False
         kwargs.pop("incremental_output", None)
-        log_ctx = kwargs.pop("_llm_log_context", None)
         tls_retried = False
         while True:
             try:
-                _log_llm_request(kwargs, context=log_ctx)
                 rsp = Generation.call(**kwargs)
             except requests.exceptions.SSLError:
                 if _tls_retry_switch_to_intl(tls_retried):
@@ -508,11 +274,9 @@ def _call_generation_nonstream(**call_kwargs):
     kwargs = dict(call_kwargs)
     kwargs["stream"] = False
     kwargs.pop("incremental_output", None)
-    log_ctx = kwargs.pop("_llm_log_context", None)
     tls_retried = False
     while True:
         try:
-            _log_llm_request(kwargs, context=log_ctx)
             rsp = Generation.call(**kwargs)
         except requests.exceptions.SSLError:
             if _tls_retry_switch_to_intl(tls_retried):
@@ -677,23 +441,6 @@ CHILD_TOOLS = [{
                 },
             },
             "required": ["name"],
-        },
-    },
-},
-{
-    "type": "function",
-    "function": {
-        "name": "compact",
-        "description": "Summarize earlier conversation so work can continue in a smaller context.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "focus": {
-                    "type": "string",
-                    "description": "The name of the skill to focus on.",
-                },
-            },
-            "required": [],
         },
     },
 }
@@ -900,9 +647,8 @@ class LoopState:
     turn_count: int = 1
     transition_reason: str | None = None
     todo: TodoManager = field(default_factory=TodoManager)
-    compact: CompactState = field(default_factory=CompactState)
 
-def run_bash(command: str, tool_use_id: str) -> str:
+def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(item in command for item in dangerous):
         return "Error: Command is dangerous blocked."
@@ -921,43 +667,43 @@ def run_bash(command: str, tool_use_id: str) -> str:
         return f"Error: {e}"
 
     output = (result.stdout + result.stderr).strip()
-    return persist_large_output(tool_use_id, output)
+    return output[:50000] if output else "No output."
 
-def run_read(path: str, tool_use_id: str, limit: int = None) -> str:
+def run_read(path: str, limit: int = None) -> str:
     text = safe_path(path).read_text()
     lines = text.splitlines()
     if limit and limit < len(lines):
         lines = lines[:limit]
-    return persist_large_output(tool_use_id, "\n".join(lines))
+    return "\n".join(lines)[:50000]  # hard cap to avoid blowing up the context
 
-def run_write(path: str, content: str, tool_use_id: str) -> str:
+def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-        return persist_large_output(tool_use_id, f"Wrote {len(content)} bytes to {path}")
+        return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
 
 
-def run_edit(path: str, old_text: str, new_text: str, tool_use_id: str) -> str:
+def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = safe_path(path)
         content = fp.read_text()
         if old_text not in content:
             return f"Error: Text not found in {path}"
         fp.write_text(content.replace(old_text, new_text, 1))
-        return persist_large_output(tool_use_id, f"Edited {path}")
+        return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
 
 
 # Handlers for the subagent only (no todo / run_subtask — avoids recursion).
 SUBAGENT_TOOL_HANDLERS = {
-    "bash":       lambda **kw: run_bash(kw["command"], kw["tool_use_id"]),
-    "read_file":  lambda **kw: run_read(kw["path"], kw["tool_use_id"], kw.get("limit")),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"], kw["tool_use_id"]),
-    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"], kw["tool_use_id"]),
+    "bash":       lambda **kw: run_bash(kw["command"]),
+    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "load_skill": lambda **kw: SKILL_REGISTRY.load_full_text(kw["name"]),
 }
 
@@ -1073,9 +819,7 @@ def execute_tool_calls(
             out = f"Error: unknown tool {name!r}"
         else:
             try:
-                tid = tc.get("id")
-                tool_use_id = str(tid) if tid is not None else ""
-                out = handler(**{**args, "tool_use_id": tool_use_id})
+                out = handler(**args)
             except TypeError as e:
                 out = f"Error: invalid arguments for {name!r}: {e}"
             except ValueError as e:
@@ -1099,8 +843,6 @@ def execute_tool_calls(
                 elif name == "run_subtask":
                     ev["title"] = (args.get("title") or "")[:80]
                     ev["prompt_preview"] = (args.get("prompt") or "")[:200]
-                elif name == "compact":
-                    ev["focus"] = (args.get("focus") or "")[:80]
                 ev["output_preview"] = (out or "")[:800]
                 events.append(ev)
             else:
@@ -1121,8 +863,6 @@ def execute_tool_calls(
                 elif name == "run_subtask":
                     t = (args.get("title") or "").strip() or "subtask"
                     print(f"\033[36mrun_subtask\033[0m [{t}]")
-                elif name == "compact":
-                    print(f"\033[33mcompact\033[0m [{args.get('focus', '')}]")
                 clip = (out or "")[:200]
                 if clip:
                     print(clip)
@@ -1162,12 +902,11 @@ def run_subagent(prompt: str, title: str = "") -> str:
     print(f"\033[36m--- subagent: {label} ---\033[0m")
     for turn in range(SUBAGENT_MAX_TURNS):
         response = _call_generation_nonstream(
-            model=LLM_MODEL,
+            model="qwen-plus",
             messages=sub_messages,
             tools=CHILD_TOOLS,
             max_tokens=6000,
             result_format="message",
-            _llm_log_context="subagent",
         )
         if response is None:
             print(f"\033[31m[{label}] no API response\033[0m")
@@ -1228,16 +967,12 @@ def _log_llm_response(response) -> None:
 
 def run_one_turn(state: LoopState, events: list | None = None) -> bool:
     handlers = build_tool_handlers(state.todo)
-    if estimate_context_size(state.messages) > CONTEXT_LIMIT:
-        print("[auto compact]")
-        state.messages[:] = compact_history(state.messages, state.compact)
     response = _call_generation_nonstream(
-        model=LLM_MODEL,  # or qwen-turbo, qwen-max, etc.
+        model="qwen-plus",  # or qwen-turbo, qwen-max, etc.
         messages=_messages_for_llm(state.messages, state.todo),
         tools=PARENT_TOOLS,
         max_tokens=8000,
         result_format="message",
-        _llm_log_context="main_agent",
     )
     _log_llm_response(response)
     if response is None:
@@ -1288,14 +1023,6 @@ def run_one_turn(state: LoopState, events: list | None = None) -> bool:
         state.transition_reason = None
         return False
 
-    manual_compact = False
-    compact_focus = None
-    for tool_message in tool_messages:
-        if tool_message.get("name") == "compact":
-            manual_compact = True
-            compact_focus = tool_message.get("focus")
-            break
-
     state.messages.extend(tool_messages)
     if not used_todo:
         reminder = state.todo.reminder()
@@ -1303,12 +1030,6 @@ def run_one_turn(state: LoopState, events: list | None = None) -> bool:
             state.messages.append({"role": "user", "content": reminder})
     state.turn_count += 1
     state.transition_reason = "tool_result"
-
-    if manual_compact:
-        print("[manual compact]")
-        state.messages[:] = compact_history(
-            state.messages, state.compact, focus=compact_focus
-        )
     return True
 
 MAX_TOOL_ROUNDS = 32
@@ -1367,7 +1088,7 @@ try:
         messages: list
         plan: str
 
-    app = _FastAPI(title="s06_subagent", version="1.0.0")
+    app = _FastAPI(title="s05_subagent", version="1.0.0")
     app.add_middleware(
         _CORSMiddleware,
         allow_origins=["*"],
@@ -1439,7 +1160,7 @@ if __name__ == "__main__":
     history: list = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
-            query = input("\033[36ms06 >> \033[0m")
+            query = input("\033[36ms05 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):

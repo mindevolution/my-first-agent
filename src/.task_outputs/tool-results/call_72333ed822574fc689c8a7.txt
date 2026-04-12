@@ -180,133 +180,6 @@ def micro_compact(messages: list) -> list:
     return messages
 
 
-def _message_content_as_str(message) -> str:
-    if message is None:
-        return ""
-    m = dict(message) if hasattr(message, "keys") and not isinstance(message, dict) else message
-    if not isinstance(m, dict):
-        return ""
-    c = m.get("content")
-    if c is None:
-        return ""
-    if isinstance(c, str):
-        return c
-    if isinstance(c, list):
-        parts: list[str] = []
-        for item in c:
-            if isinstance(item, dict) and "text" in item:
-                parts.append(item.get("text") or "")
-            elif isinstance(item, str):
-                parts.append(item)
-        return "".join(parts)
-    return str(c)
-
-
-def _tool_names_for_llm_log(tools) -> list[str]:
-    if not tools:
-        return []
-    names: list[str] = []
-    for item in tools:
-        d = item if isinstance(item, dict) else None
-        if d is None and item is not None and hasattr(item, "keys"):
-            try:
-                d = dict(item)
-            except Exception:
-                continue
-        if not isinstance(d, dict):
-            continue
-        fn = d.get("function")
-        if not isinstance(fn, dict) and fn is not None and hasattr(fn, "keys"):
-            try:
-                fn = dict(fn)
-            except Exception:
-                fn = {}
-        if isinstance(fn, dict):
-            n = fn.get("name")
-            if n:
-                names.append(n)
-    return names
-
-
-def _messages_detail_for_llm_log(messages) -> list[dict]:
-    rows: list[dict] = []
-    if not messages:
-        return rows
-    cap = PREVIEW_CHARS
-    for raw in messages:
-        d = raw if isinstance(raw, dict) else None
-        if d is None and raw is not None and hasattr(raw, "keys"):
-            try:
-                d = dict(raw)
-            except Exception:
-                rows.append({
-                    "role": "?",
-                    "content_chars": 0,
-                    "content_preview": "(unserializable message)",
-                })
-                continue
-        if not isinstance(d, dict):
-            rows.append({
-                "role": "?",
-                "content_chars": 0,
-                "content_preview": "(non-dict message)",
-            })
-            continue
-        role = d.get("role", "")
-        text = _message_content_as_str(d)
-        prev = text[:cap] + ("..." if len(text) > cap else "")
-        row: dict = {"role": role, "content_chars": len(text), "content_preview": prev}
-        tcs = d.get("tool_calls")
-        if tcs:
-            tnames: list[str] = []
-            for tc in tcs:
-                tcd = tc if isinstance(tc, dict) else None
-                if tcd is None and tc is not None and hasattr(tc, "keys"):
-                    try:
-                        tcd = dict(tc)
-                    except Exception:
-                        continue
-                if not isinstance(tcd, dict):
-                    continue
-                fn = tcd.get("function")
-                if not isinstance(fn, dict) and fn is not None and hasattr(fn, "keys"):
-                    try:
-                        fn = dict(fn)
-                    except Exception:
-                        fn = {}
-                if isinstance(fn, dict):
-                    n = fn.get("name")
-                    if n:
-                        tnames.append(n)
-            if tnames:
-                row["assistant_tool_names"] = tnames
-        if role == "tool":
-            row["tool_call_id"] = d.get("tool_call_id")
-            row["tool_name"] = d.get("name")
-        rows.append(row)
-    return rows
-
-
-def _log_llm_request(kwargs: dict, *, context: str | None = None) -> None:
-    """Log outbound Generation.call: model, tools, and per-message content previews."""
-    msgs = kwargs.get("messages") or []
-    msg_rows = _messages_detail_for_llm_log(msgs)
-    record = {
-        "context": context,
-        "model": kwargs.get("model"),
-        "max_tokens": kwargs.get("max_tokens"),
-        "result_format": kwargs.get("result_format"),
-        "stream": kwargs.get("stream"),
-        "incremental_output": kwargs.get("incremental_output"),
-        "temperature": kwargs.get("temperature"),
-        "tool_names": _tool_names_for_llm_log(kwargs.get("tools")),
-        "message_count": len(msgs),
-        "total_content_chars": sum(r.get("content_chars", 0) for r in msg_rows),
-        "messages": msg_rows,
-    }
-    logger.info("LLM request: %s", json.dumps(record, ensure_ascii=False, default=str))
-
-
 def write_transcript(messages: list) -> Path:
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
@@ -373,6 +246,28 @@ def _dashscope_ssl_hint() -> None:
     )
 
 
+def _message_content_as_str(message) -> str:
+    if message is None:
+        return ""
+    m = dict(message) if hasattr(message, "keys") and not isinstance(message, dict) else message
+    if not isinstance(m, dict):
+        return ""
+    c = m.get("content")
+    if c is None:
+        return ""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts: list[str] = []
+        for item in c:
+            if isinstance(item, dict) and "text" in item:
+                parts.append(item.get("text") or "")
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts)
+    return str(c)
+
+
 def _tls_retry_switch_to_intl(already_retried: bool) -> bool:
     """Return True if we switched endpoint and caller should retry. False = give up."""
     if already_retried:
@@ -400,7 +295,6 @@ def _stream_generation_to_stdout(**call_kwargs):
     kwargs = dict(call_kwargs)
     kwargs["stream"] = True
     kwargs["incremental_output"] = True
-    log_ctx = kwargs.pop("_llm_log_context", None)
 
     prev_full = ""
     last_rsp = None
@@ -408,6 +302,7 @@ def _stream_generation_to_stdout(**call_kwargs):
 
     while True:
         try:
+            log_ctx = kwargs.pop("_llm_log_context", None)
             _log_llm_request(kwargs, context=log_ctx)
             gen = Generation.call(**kwargs)
         except requests.exceptions.SSLError:
@@ -467,11 +362,9 @@ def _generation_to_stdout(**call_kwargs):
     if kwargs.get("tools"):
         kwargs["stream"] = False
         kwargs.pop("incremental_output", None)
-        log_ctx = kwargs.pop("_llm_log_context", None)
         tls_retried = False
         while True:
             try:
-                _log_llm_request(kwargs, context=log_ctx)
                 rsp = Generation.call(**kwargs)
             except requests.exceptions.SSLError:
                 if _tls_retry_switch_to_intl(tls_retried):
@@ -508,11 +401,9 @@ def _call_generation_nonstream(**call_kwargs):
     kwargs = dict(call_kwargs)
     kwargs["stream"] = False
     kwargs.pop("incremental_output", None)
-    log_ctx = kwargs.pop("_llm_log_context", None)
     tls_retried = False
     while True:
         try:
-            _log_llm_request(kwargs, context=log_ctx)
             rsp = Generation.call(**kwargs)
         except requests.exceptions.SSLError:
             if _tls_retry_switch_to_intl(tls_retried):
@@ -900,7 +791,6 @@ class LoopState:
     turn_count: int = 1
     transition_reason: str | None = None
     todo: TodoManager = field(default_factory=TodoManager)
-    compact: CompactState = field(default_factory=CompactState)
 
 def run_bash(command: str, tool_use_id: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
@@ -1167,7 +1057,6 @@ def run_subagent(prompt: str, title: str = "") -> str:
             tools=CHILD_TOOLS,
             max_tokens=6000,
             result_format="message",
-            _llm_log_context="subagent",
         )
         if response is None:
             print(f"\033[31m[{label}] no API response\033[0m")
@@ -1228,16 +1117,12 @@ def _log_llm_response(response) -> None:
 
 def run_one_turn(state: LoopState, events: list | None = None) -> bool:
     handlers = build_tool_handlers(state.todo)
-    if estimate_context_size(state.messages) > CONTEXT_LIMIT:
-        print("[auto compact]")
-        state.messages[:] = compact_history(state.messages, state.compact)
     response = _call_generation_nonstream(
         model=LLM_MODEL,  # or qwen-turbo, qwen-max, etc.
         messages=_messages_for_llm(state.messages, state.todo),
         tools=PARENT_TOOLS,
         max_tokens=8000,
         result_format="message",
-        _llm_log_context="main_agent",
     )
     _log_llm_response(response)
     if response is None:
@@ -1305,10 +1190,8 @@ def run_one_turn(state: LoopState, events: list | None = None) -> bool:
     state.transition_reason = "tool_result"
 
     if manual_compact:
-        print("[manual compact]")
-        state.messages[:] = compact_history(
-            state.messages, state.compact, focus=compact_focus
-        )
+            print("[manual compact]")
+            state.messages[:] = compact_history(state.messages, state, focus=compact_focus)
     return True
 
 MAX_TOOL_ROUNDS = 32
