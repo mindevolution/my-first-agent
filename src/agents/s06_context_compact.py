@@ -1088,7 +1088,7 @@ try:
         messages: list
         plan: str
 
-    app = _FastAPI(title="s05_subagent", version="1.0.0")
+    app = _FastAPI(title="s06_subagent", version="1.0.0")
     app.add_middleware(
         _CORSMiddleware,
         allow_origins=["*"],
@@ -1160,7 +1160,7 @@ if __name__ == "__main__":
     history: list = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
-            query = input("\033[36ms05 >> \033[0m")
+            query = input("\033[36ms06 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
