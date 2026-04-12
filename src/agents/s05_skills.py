@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
 # Harness: the loop -- keep feeding real tool results back into the model.
-"""
-s04_subagent.py — Todo coding agent (CLI, HTTP API, or `python ... serve`).
-
-    user message
-        -> model reply with todo plan
-        -> update plan state
-        -> continue execution
-
-Also exposes a FastAPI app (`app`) for a Vite React UI.
-"""
-
 import json
 import logging
 import os
@@ -44,6 +33,7 @@ _INTL_HTTP_BASE = "https://dashscope-intl.aliyuncs.com/api/v1"
 
 WORKDIR = Path.cwd()
 PLAN_REMINDER_INTERVAL = 3
+SKILLS_DIR = WORKDIR / "src/skills"
 
 # Auth
 dashscope.api_key = os.environ.get("DASHSCOPE_API_KEY")
@@ -53,6 +43,73 @@ if os.environ.get("DASHSCOPE_USE_INTL", "").strip().lower() in ("1", "true", "ye
     dashscope.base_http_api_url = _INTL_HTTP_BASE.rstrip("/")
 elif _custom := os.environ.get("DASHSCOPE_HTTP_BASE_URL"):
     dashscope.base_http_api_url = _custom.rstrip("/")
+
+@dataclass
+class SkillManifest:
+    name: str
+    description: str
+    path: Path
+
+
+@dataclass
+class SkillDocument:
+    manifest: SkillManifest
+    body: str
+
+class SkillRegistry:
+    def __init__(self, skills_dir: Path):
+        self.skills_dir = skills_dir
+        self.documents: dict[str, SkillDocument] = {}
+        self._load_all()
+
+    def _load_all(self) -> None:
+        if not self.skills_dir.exists():
+            return
+
+        for path in sorted(self.skills_dir.rglob("SKILL.md")):
+            meta, body = self._parse_frontmatter(path.read_text())
+            name = meta.get("name", path.parent.name)
+            description = meta.get("description", "No description")
+            manifest = SkillManifest(name=name, description=description, path=path)
+            self.documents[name] = SkillDocument(manifest=manifest, body=body.strip())
+
+    def _parse_frontmatter(self, text: str) -> tuple[dict, str]:
+        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+        if not match:
+            return {}, text
+
+        meta = {}
+        for line in match.group(1).strip().splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            meta[key.strip()] = value.strip()
+        return meta, match.group(2)
+
+    def describe_available(self) -> str:
+        if not self.documents:
+            return "(no skills available)"
+        lines = []
+        for name in sorted(self.documents):
+            manifest = self.documents[name].manifest
+            lines.append(f"- {manifest.name}: {manifest.description}")
+        return "\n".join(lines)
+
+    def load_full_text(self, name: str) -> str:
+        document = self.documents.get(name)
+        if not document:
+            known = ", ".join(sorted(self.documents)) or "(none)"
+            return f"Error: Unknown skill '{name}'. Available skills: {known}"
+
+        return (
+            f"<skill name=\"{document.manifest.name}\">\n"
+            f"{document.body}\n"
+            "</skill>"
+        )
+
+
+SKILL_REGISTRY = SkillRegistry(SKILLS_DIR)
+
 
 
 def _dashscope_ssl_hint() -> None:
@@ -232,6 +289,11 @@ def _call_generation_nonstream(**call_kwargs):
 
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 
+Use load_skill when a task needs specialized instructions before you act.
+
+Skills available:
+{SKILL_REGISTRY.describe_available()}
+
 Planning (required for multi-step work):
 - If the user asks for anything that needs more than one tool call or more than one file/command, you MUST call `todo` first in that turn. Build a short checklist: one item `in_progress`, others `pending`.
 - After each substantive step (file written, command run, etc.), call `todo` again to mark completed items and move `in_progress` to the next pending item.
@@ -365,6 +427,23 @@ CHILD_TOOLS = [{
         },
     },
 },
+{
+    "type": "function",
+    "function": {
+        "name": "load_skill",
+        "description": "Load the full body of a named skill into the current context.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The name of the skill to load.",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+}
 ]
 
 PARENT_TOOLS = CHILD_TOOLS + [{
@@ -625,15 +704,12 @@ SUBAGENT_TOOL_HANDLERS = {
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "load_skill": lambda **kw: SKILL_REGISTRY.load_full_text(kw["name"]),
 }
 
 
 def build_tool_handlers(todo: TodoManager) -> dict:
-    return {
-        "bash":       lambda **kw: run_bash(kw["command"]),
-        "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
-        "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-        "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    return SUBAGENT_TOOL_HANDLERS | {
         "todo":       lambda **kw: todo.update(kw["items"]),
         "run_subtask": lambda **kw: invoke_run_subtask(**kw),
     }
@@ -1068,7 +1144,10 @@ if __name__ == "__main__":
 
     _logs_dir = WORKDIR / "logs"
     _logs_dir.mkdir(parents=True, exist_ok=True)
-    _log_path = _logs_dir / "s04_subagent.log"
+
+    # Set log file name to match the current Python file name, but in logs dir
+    _log_filename = os.path.splitext(os.path.basename(__file__))[0] + ".log"
+    _log_path = _logs_dir / _log_filename
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
