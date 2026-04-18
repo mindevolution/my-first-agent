@@ -51,6 +51,47 @@ from dashscope import Generation
 
 logger = logging.getLogger(__name__)
 
+# Human-facing progress for blocking LLM calls (stderr so it does not mix with tool/stdout traces).
+_LLM_PROGRESS_LABELS = {
+    "main_agent": "main agent",
+    "subagent": "sub-agent",
+    "compact_summary": "conversation summary",
+}
+
+
+def _stderr_llm_waiting(context: str | None) -> None:
+    label = _LLM_PROGRESS_LABELS.get(context or "", context or "model")
+    print(
+        f"\033[2m[LLM]\033[0m Waiting for model response ({label})…",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _stderr_llm_done(context: str | None, response) -> None:
+    label = _LLM_PROGRESS_LABELS.get(context or "", context or "model")
+    if response is None:
+        print(
+            f"\033[2m[LLM]\033[0m \033[31mNo response\033[0m ({label})",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    if getattr(response, "status_code", None) == 200:
+        print(
+            f"\033[2m[LLM]\033[0m \033[32mResponse received\033[0m ({label})",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        code = getattr(response, "code", "") or getattr(response, "status_code", "")
+        print(
+            f"\033[2m[LLM]\033[0m \033[33mAPI error {code}\033[0m ({label})",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 # International API host (use if your key is from Model Studio outside China, or TLS to China fails).
 _INTL_HTTP_BASE = "https://dashscope-intl.aliyuncs.com/api/v1"
 
@@ -417,7 +458,7 @@ def write_transcript(messages: list) -> Path:
     return path
 
 
-def summarize_history(messages: list) -> str:
+def summarize_history(messages: list, *, show_progress: bool = True) -> str:
     conversation = json.dumps(messages, default=str)[:80000]
     prompt = (
         "Summarize this coding-agent conversation so work can continue.\n"
@@ -437,15 +478,25 @@ def summarize_history(messages: list) -> str:
         "result_format": "message",
     }
     _log_llm_request(_compact_kw, context="compact_summary")
+    if show_progress:
+        _stderr_llm_waiting("compact_summary")
     response = Generation.call(**_compact_kw)
+    if show_progress:
+        _stderr_llm_done("compact_summary", response)
     return response.output.choices[0].message.content.strip()
 
 
-def compact_history(messages: list, state: CompactState, focus: str | None = None) -> list:
+def compact_history(
+    messages: list,
+    state: CompactState,
+    focus: str | None = None,
+    *,
+    llm_progress: bool = True,
+) -> list:
     transcript_path = write_transcript(messages)
     print(f"[transcript saved: {transcript_path}]")
 
-    summary = summarize_history(messages)
+    summary = summarize_history(messages, show_progress=llm_progress)
     if focus:
         summary += f"\n\nFocus to preserve next: {focus}"
     if state.recent_files:
@@ -502,6 +553,7 @@ def _stream_generation_to_stdout(**call_kwargs):
     kwargs["stream"] = True
     kwargs["incremental_output"] = True
     log_ctx = kwargs.pop("_llm_log_context", None)
+    show_progress = kwargs.pop("_llm_user_progress", False)
 
     prev_full = ""
     last_rsp = None
@@ -510,12 +562,16 @@ def _stream_generation_to_stdout(**call_kwargs):
     while True:
         try:
             _log_llm_request(kwargs, context=log_ctx)
+            if show_progress:
+                _stderr_llm_waiting(log_ctx)
             gen = Generation.call(**kwargs)
         except requests.exceptions.SSLError:
             if _tls_retry_switch_to_intl(tls_retried):
                 tls_retried = True
                 prev_full = ""
                 continue
+            if show_progress:
+                _stderr_llm_done(log_ctx, None)
             _dashscope_ssl_hint()
             return None
 
@@ -546,9 +602,13 @@ def _stream_generation_to_stdout(**call_kwargs):
                 prev_full = ""
                 continue
             _dashscope_ssl_hint()
+            if show_progress:
+                _stderr_llm_done(log_ctx, None)
             return None
         break
 
+    if show_progress:
+        _stderr_llm_done(log_ctx, last_rsp)
     sys.stdout.write("\n")
     sys.stdout.flush()
     return last_rsp
@@ -563,15 +623,22 @@ def _call_generation_nonstream(**call_kwargs):
     kwargs["stream"] = False
     kwargs.pop("incremental_output", None)
     log_ctx = kwargs.pop("_llm_log_context", None)
+    show_progress = kwargs.pop("_llm_user_progress", False)
     tls_retried = False
     while True:
         try:
             _log_llm_request(kwargs, context=log_ctx)
+            if show_progress:
+                _stderr_llm_waiting(log_ctx)
             rsp = Generation.call(**kwargs)
+            if show_progress:
+                _stderr_llm_done(log_ctx, rsp)
         except requests.exceptions.SSLError:
             if _tls_retry_switch_to_intl(tls_retried):
                 tls_retried = True
                 continue
+            if show_progress:
+                _stderr_llm_done(log_ctx, None)
             _dashscope_ssl_hint()
             return None
         return rsp
@@ -1274,6 +1341,7 @@ def run_subagent(prompt: str, title: str = "") -> str:
             max_tokens=6000,
             result_format="message",
             _llm_log_context="subagent",
+            _llm_user_progress=True,
         )
         if response is None:
             print(f"\033[31m[{label}] no API response\033[0m")
@@ -1336,7 +1404,9 @@ def run_one_turn(state: LoopState, events: list | None = None) -> bool:
     handlers = build_tool_handlers(state.todo)
     if estimate_context_size(state.messages) > CONTEXT_LIMIT:
         print("[auto compact]")
-        state.messages[:] = compact_history(state.messages, state.compact)
+        state.messages[:] = compact_history(
+            state.messages, state.compact, llm_progress=(events is None)
+        )
     response = _call_generation_nonstream(
         model=LLM_MODEL,  # or qwen-turbo, qwen-max, etc.
         messages=_messages_for_llm(state.messages, state.todo),
@@ -1344,6 +1414,7 @@ def run_one_turn(state: LoopState, events: list | None = None) -> bool:
         max_tokens=8000,
         result_format="message",
         _llm_log_context="main_agent",
+        _llm_user_progress=(events is None),
     )
     _log_llm_response(response)
     if response is None:
@@ -1413,7 +1484,10 @@ def run_one_turn(state: LoopState, events: list | None = None) -> bool:
     if manual_compact:
         print("[manual compact]")
         state.messages[:] = compact_history(
-            state.messages, state.compact, focus=compact_focus
+            state.messages,
+            state.compact,
+            focus=compact_focus,
+            llm_progress=(events is None),
         )
     return True
 
@@ -1473,7 +1547,7 @@ try:
         messages: list
         plan: str
 
-    app = _FastAPI(title="s06_subagent", version="1.0.0")
+    app = _FastAPI(title="s07_task_system", version="1.0.0")
     app.add_middleware(
         _CORSMiddleware,
         allow_origins=["*"],
@@ -1545,7 +1619,7 @@ if __name__ == "__main__":
     history: list = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
-            query = input("\033[36ms06 >> \033[0m")
+            query = input("\033[36ms07 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
