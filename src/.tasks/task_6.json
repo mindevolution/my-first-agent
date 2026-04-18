@@ -1,0 +1,10 @@
+{
+  "id": 6,
+  "subject": "Emit output",
+  "description": "",
+  "status": "pending",
+  "blockedBy": [
+    4
+  ],
+  "owner": ""
+}
