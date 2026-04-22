@@ -33,6 +33,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import threading
 import uuid
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
 try:
     import readline
 
@@ -107,6 +111,16 @@ PREVIEW_CHARS = 2000
 TRANSCRIPT_DIR = WORKDIR / "src/.transcripts"
 TOOL_RESULTS_DIR = WORKDIR / "src/.task_outputs" / "tool-results"
 TASKS_DIR = WORKDIR / "src/.tasks"
+TEAM_DIR = WORKDIR / "src/.team"
+INBOX_DIR = TEAM_DIR / "inbox"
+
+VALID_MSG_TYPES = {
+    "message",
+    "broadcast",
+    "shutdown_request",
+    "shutdown_response",
+    "plan_approval_response",
+}
 
 try:
     LLM_REQUEST_TIMEOUT_SEC = max(5, int(os.environ.get("LLM_REQUEST_TIMEOUT_SEC", "45")))
@@ -186,6 +200,204 @@ class BackgroundManager:
 BG = BackgroundManager()
 
 
+# -- MessageBus: JSONL inbox per teammate --
+class MessageBus:
+    def __init__(self, inbox_dir: Path):
+        self.dir = inbox_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def send(
+        self,
+        sender: str,
+        to: str,
+        content: str,
+        msg_type: str = "message",
+        extra: dict | None = None,
+    ) -> str:
+        if msg_type not in VALID_MSG_TYPES:
+            return f"Error: Invalid type '{msg_type}'. Valid: {sorted(VALID_MSG_TYPES)}"
+        msg = {
+            "type": msg_type,
+            "from": sender,
+            "content": content,
+            "timestamp": time.time(),
+        }
+        if extra:
+            msg.update(extra)
+        inbox_path = self.dir / f"{to}.jsonl"
+        with self._lock:
+            with inbox_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        return f"Sent {msg_type} to {to}"
+
+    def read_inbox(self, name: str) -> list:
+        inbox_path = self.dir / f"{name}.jsonl"
+        if not inbox_path.exists():
+            return []
+        with self._lock:
+            raw = inbox_path.read_text(encoding="utf-8")
+            inbox_path.write_text("", encoding="utf-8")
+        out = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return out
+
+    def broadcast(self, sender: str, content: str, teammates: list[str]) -> str:
+        count = 0
+        for name in teammates:
+            if name != sender:
+                self.send(sender, name, content, "broadcast")
+                count += 1
+        return f"Broadcast to {count} teammates"
+
+
+BUS = MessageBus(INBOX_DIR)
+
+
+# -- TeammateManager: persistent named agents with config.json --
+class TeammateManager:
+    def __init__(self, team_dir: Path):
+        self.dir = team_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.config_path = self.dir / "config.json"
+        self._lock = threading.Lock()
+        self.threads: dict[str, threading.Thread] = {}
+        self.stop_events: dict[str, threading.Event] = {}
+        self.config = self._load_config()
+
+    def _load_config(self) -> dict:
+        if self.config_path.exists():
+            return json.loads(self.config_path.read_text(encoding="utf-8"))
+        return {"team_name": "default", "members": []}
+
+    def _save_config_locked(self) -> None:
+        self.config_path.write_text(
+            json.dumps(self.config, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _find_member_locked(self, name: str) -> dict | None:
+        for member in self.config["members"]:
+            if member["name"] == name:
+                return member
+        return None
+
+    def _set_member_state(self, name: str, *, role: str | None = None, status: str | None = None) -> None:
+        with self._lock:
+            member = self._find_member_locked(name)
+            if member is None:
+                member = {"name": name, "role": role or "teammate", "status": status or "idle"}
+                self.config["members"].append(member)
+            if role is not None:
+                member["role"] = role
+            if status is not None:
+                member["status"] = status
+            self._save_config_locked()
+
+    def _ensure_thread(self, name: str, role: str, prompt: str) -> None:
+        t = self.threads.get(name)
+        if t and t.is_alive():
+            return
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._teammate_loop,
+            args=(name, role, prompt, stop_event),
+            daemon=True,
+        )
+        self.stop_events[name] = stop_event
+        self.threads[name] = thread
+        thread.start()
+
+    def spawn(self, name: str, role: str, prompt: str) -> str:
+        self._set_member_state(name, role=role, status="working")
+        self._ensure_thread(name, role, prompt)
+        BUS.send("lead", name, prompt, "message", extra={"source": "spawn"})
+        return f"Spawned '{name}' (role: {role})"
+
+    def _teammate_loop(self, name: str, role: str, initial_prompt: str, stop_event: threading.Event) -> None:
+        sys_prompt = (
+            f"You are teammate '{name}', role: {role}, at {WORKDIR}. "
+            "Use send_message to coordinate with other teammates and lead."
+        )
+        messages: list = [{"role": "user", "content": initial_prompt}]
+        handlers = build_actor_tool_handlers(name)
+        first_round = True
+
+        while not stop_event.is_set():
+            inbox = BUS.read_inbox(name)
+            if inbox:
+                self._set_member_state(name, role=role, status="working")
+                for msg in inbox:
+                    messages.append({"role": "user", "content": json.dumps(msg, ensure_ascii=False)})
+            elif not first_round:
+                self._set_member_state(name, role=role, status="idle")
+                stop_event.wait(0.6)
+                continue
+            first_round = False
+
+            response = _call_generation_nonstream(
+                model=LLM_MODEL,
+                messages=[{"role": "system", "content": sys_prompt}, *messages],
+                tools=CHILD_TOOLS,
+                max_tokens=6000,
+                result_format="message",
+                _llm_log_context="subagent",
+                _llm_user_progress=False,
+            )
+            if response is None:
+                BUS.send(name, "lead", f"{name} got no API response", "message")
+                stop_event.wait(1.0)
+                continue
+            if response.status_code != 200:
+                BUS.send(
+                    name,
+                    "lead",
+                    f"{name} API error: {response.code} {getattr(response, 'message', '')}",
+                    "message",
+                )
+                stop_event.wait(1.0)
+                continue
+
+            assistant_msg, _ = _assistant_message_and_finish_reason(response)
+            assistant_msg = _normalize_assistant_message_for_dashscope(assistant_msg)
+            text = _message_content_as_str(assistant_msg).strip()
+            messages.append(assistant_msg)
+            if text:
+                BUS.send(name, "lead", text, "message")
+
+            tool_calls = assistant_msg.get("tool_calls")
+            if not tool_calls:
+                self._set_member_state(name, role=role, status="idle")
+                continue
+            tool_messages = execute_tool_calls(tool_calls, handlers, events=None)
+            if tool_messages:
+                messages.extend(tool_messages)
+
+        self._set_member_state(name, role=role, status="shutdown")
+
+    def list_all(self) -> str:
+        with self._lock:
+            members = list(self.config.get("members", []))
+            team_name = self.config.get("team_name", "default")
+        if not members:
+            return "No teammates."
+        lines = [f"Team: {team_name}"]
+        for m in members:
+            lines.append(f"  {m.get('name', '?')} ({m.get('role', '?')}): {m.get('status', 'unknown')}")
+        return "\n".join(lines)
+
+    def member_names(self) -> list[str]:
+        with self._lock:
+            return [m.get("name", "") for m in self.config.get("members", []) if m.get("name")]
+
+
 # -- TaskManager: CRUD with dependency graph, persisted as JSON files --
 class TaskManager:
     def __init__(self, tasks_dir: Path):
@@ -262,6 +474,7 @@ class TaskManager:
 
 
 TASKS = TaskManager(TASKS_DIR)
+TEAM = TeammateManager(TEAM_DIR)
 
 @dataclass
 class SkillManifest:
@@ -762,6 +975,11 @@ SYSTEM = f"""You are a coding agent at {WORKDIR}.
 
 Use load_skill when a task needs specialized instructions before you act.
 
+Team coordination:
+- You can spawn persistent teammates with `spawn_teammate`.
+- Use `send_message`, `read_inbox`, and `broadcast` for coordination.
+- Use `list_teammates` to check teammate status.
+
 Skills available:
 {SKILL_REGISTRY.describe_available()}
 
@@ -940,18 +1158,18 @@ CHILD_TOOLS = [{
         "description": "Create a new task.",
         "parameters": {
             "type": "object",
-        },
-        "properties": {
-            "subject": {
-                "type": "string",
-                "description": "The subject of the task.",
+            "properties": {
+                "subject": {
+                    "type": "string",
+                    "description": "The subject of the task.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "The description of the task.",
+                },
             },
-            "description": {
-                "type": "string",
-                "description": "The description of the task.",
-            },
+            "required": ["subject"],
         },
-        "required": ["subject"],
     },
 },
 {
@@ -1026,14 +1244,14 @@ CHILD_TOOLS = [{
         "description": "Run a background task.",
         "parameters": {
             "type": "object",
-        },
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "The command to run.",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The command to run.",
+                },
             },
+            "required": ["command"],
         },
-        "required": ["command"],
     },
 },
 {
@@ -1043,6 +1261,94 @@ CHILD_TOOLS = [{
         "description": "Check the status of a background task.",
         "parameters": {
             "type": "object",
+        },
+    },
+},
+{
+    "type": "function",
+    "function": {
+        "name": "spawn_teammate",
+        "description": "Spawn a persistent teammate that runs in its own thread.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Teammate name, e.g. 'alice'.",
+                },
+                "role": {
+                    "type": "string",
+                    "description": "Teammate role, e.g. 'coder' or 'researcher'.",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Initial task prompt for the teammate.",
+                },
+            },
+            "required": ["name", "role", "prompt"],
+        },
+    },
+},
+{
+    "type": "function",
+    "function": {
+        "name": "list_teammates",
+        "description": "List all teammates with role and status.",
+        "parameters": {
+            "type": "object",
+        },
+    },
+},
+{
+    "type": "function",
+    "function": {
+        "name": "send_message",
+        "description": "Send a message to a teammate inbox.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "description": "Recipient teammate name.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Message content.",
+                },
+                "msg_type": {
+                    "type": "string",
+                    "enum": sorted(VALID_MSG_TYPES),
+                    "description": "Message type (default: message).",
+                },
+            },
+            "required": ["to", "content"],
+        },
+    },
+},
+{
+    "type": "function",
+    "function": {
+        "name": "read_inbox",
+        "description": "Read and drain the current agent inbox.",
+        "parameters": {
+            "type": "object",
+        },
+    },
+},
+{
+    "type": "function",
+    "function": {
+        "name": "broadcast",
+        "description": "Broadcast a message to all teammates.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "Message content.",
+                },
+            },
+            "required": ["content"],
         },
     },
 }
@@ -1182,6 +1488,27 @@ def _tool_names_in_assistant_calls(tool_calls) -> set[str]:
     return names
 
 
+def _tool_calls_fingerprint(tool_calls) -> str:
+    """Stable signature for assistant tool-call batches, used for loop detection."""
+    normalized: list[dict] = []
+    for tc in tool_calls or []:
+        tc = _as_dict(tc)
+        fn = _as_dict(tc.get("function"))
+        name = (fn.get("name") or "").strip()
+        raw_args = fn.get("arguments") or "{}"
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                args = {}
+        else:
+            args = raw_args or {}
+        if not isinstance(args, dict):
+            args = {}
+        normalized.append({"name": name, "args": args})
+    return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+
+
 def _messages_for_llm(messages: list, todo: TodoManager) -> list:
     """Copy messages and inject live plan after the system message (not stored in state.messages)."""
     if not messages:
@@ -1211,6 +1538,8 @@ class LoopState:
     transition_reason: str | None = None
     todo: TodoManager = field(default_factory=TodoManager)
     compact: CompactState = field(default_factory=CompactState)
+    last_tool_fingerprint: str | None = None
+    repeated_tool_call_count: int = 0
 
 def run_bash(command: str, tool_use_id: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
@@ -1262,24 +1591,36 @@ def run_edit(path: str, old_text: str, new_text: str, tool_use_id: str) -> str:
         return f"Error: {e}"
 
 
-# Handlers for the subagent only (no todo / run_subtask — avoids recursion).
-SUBAGENT_TOOL_HANDLERS = {
-    "bash":       lambda **kw: run_bash(kw["command"], kw["tool_use_id"]),
-    "read_file":  lambda **kw: run_read(kw["path"], kw["tool_use_id"], kw.get("limit")),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"], kw["tool_use_id"]),
-    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"], kw["tool_use_id"]),
-    "load_skill": lambda **kw: SKILL_REGISTRY.load_full_text(kw["name"]),
-    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
-    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("removeBlockedBy")),
-    "task_list":   lambda **kw: TASKS.list_all(),
-    "task_get":    lambda **kw: TASKS.get(kw["task_id"]),
-    "background_run": lambda **kw: BG.run(kw["command"]),
-    "check_background": lambda **kw: BG.check(),
-}
+def build_actor_tool_handlers(actor: str) -> dict:
+    return {
+        "bash":       lambda **kw: run_bash(kw["command"], kw["tool_use_id"]),
+        "read_file":  lambda **kw: run_read(kw["path"], kw["tool_use_id"], kw.get("limit")),
+        "write_file": lambda **kw: run_write(kw["path"], kw["content"], kw["tool_use_id"]),
+        "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"], kw["tool_use_id"]),
+        "load_skill": lambda **kw: SKILL_REGISTRY.load_full_text(kw["name"]),
+        "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
+        "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("removeBlockedBy")),
+        "task_list":   lambda **kw: TASKS.list_all(),
+        "task_get":    lambda **kw: TASKS.get(kw["task_id"]),
+        "background_run": lambda **kw: BG.run(kw.get("command") or kw.get("cmd") or (_ for _ in ()).throw(
+            ValueError("background_run requires 'command'")
+        )),
+        "check_background": lambda **kw: BG.check(),
+        "spawn_teammate": lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
+        "list_teammates": lambda **kw: TEAM.list_all(),
+        "send_message": lambda **kw: BUS.send(
+            actor,
+            kw["to"],
+            kw["content"],
+            kw.get("msg_type", "message"),
+        ),
+        "read_inbox": lambda **kw: json.dumps(BUS.read_inbox(actor), indent=2, ensure_ascii=False),
+        "broadcast": lambda **kw: BUS.broadcast(actor, kw["content"], TEAM.member_names()),
+    }
 
 
 def build_tool_handlers(todo: TodoManager) -> dict:
-    return SUBAGENT_TOOL_HANDLERS | {
+    return build_actor_tool_handlers("lead") | {
         "todo":       lambda **kw: todo.update(kw["items"]),
         "run_subtask": lambda **kw: invoke_run_subtask(**kw),
     }
@@ -1473,7 +1814,7 @@ def run_subagent(prompt: str, title: str = "") -> str:
         {"role": "system", "content": SUBAGENT_SYSTEM},
         {"role": "user", "content": prompt},
     ]
-    handlers = SUBAGENT_TOOL_HANDLERS
+    handlers = build_actor_tool_handlers("subagent")
     last_text = ""
     print(f"\033[36m--- subagent: {label} ---\033[0m")
     for turn in range(SUBAGENT_MAX_TURNS):
@@ -1601,6 +1942,28 @@ def run_one_turn(state: LoopState, events: list | None = None) -> bool:
 
     tool_calls = assistant_msg.get("tool_calls")
     if not tool_calls:
+        state.last_tool_fingerprint = None
+        state.repeated_tool_call_count = 0
+        state.transition_reason = None
+        return False
+
+    fp = _tool_calls_fingerprint(tool_calls)
+    if fp and fp == state.last_tool_fingerprint:
+        state.repeated_tool_call_count += 1
+    else:
+        state.last_tool_fingerprint = fp
+        state.repeated_tool_call_count = 1
+
+    if state.repeated_tool_call_count >= 4:
+        warn = (
+            "Agent stopped: repeated identical tool calls detected "
+            f"({state.repeated_tool_call_count}x)."
+        )
+        if events is not None:
+            events.append({"type": "warning", "message": warn})
+        else:
+            print(f"\033[33m{warn}\033[0m")
+        state.messages.append({"role": "assistant", "content": warn})
         state.transition_reason = None
         return False
 
@@ -1770,11 +2133,17 @@ if __name__ == "__main__":
     history: list = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
-            query = input("\033[36ms07 >> \033[0m")
+            query = input("\033[36ms09 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        if query.strip() == "/team":
+            print(TEAM.list_all())
+            continue
+        if query.strip() == "/inbox":
+            print(json.dumps(BUS.read_inbox("lead"), indent=2, ensure_ascii=False))
+            continue
 
         history.append({"role": "user", "content": query})
         state = LoopState(messages=history)

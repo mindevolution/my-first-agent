@@ -1,0 +1,1 @@
+This is a temporary file created while background task runs.
