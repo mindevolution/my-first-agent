@@ -1,0 +1,11 @@
+{
+  "id": 9,
+  "subject": "Frontend Login Page",
+  "description": "Create responsive login page with form validation, error handling, and integration with backend auth API.",
+  "status": "in_progress",
+  "blockedBy": [],
+  "owner": "",
+  "worktree": "ui-login",
+  "created_at": 1776868005.011538,
+  "updated_at": 1776868030.393022
+}

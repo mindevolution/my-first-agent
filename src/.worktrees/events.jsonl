@@ -1,0 +1,8 @@
+{"event": "worktree.create.before", "ts": 1776868030.298614, "task": {"id": 8}, "worktree": {"name": "auth-refactor", "base_ref": "HEAD"}}
+{"event": "worktree.create.after", "ts": 1776868030.3621702, "task": {"id": 8}, "worktree": {"name": "auth-refactor", "path": "/Users/hlsfamily/Projects/ai/MyFirstAgent/src/.worktrees/auth-refactor", "branch": "wt/auth-refactor", "status": "active"}}
+{"event": "worktree.create.before", "ts": 1776868030.362329, "task": {"id": 9}, "worktree": {"name": "ui-login", "base_ref": "HEAD"}}
+{"event": "worktree.create.after", "ts": 1776868030.393116, "task": {"id": 9}, "worktree": {"name": "ui-login", "path": "/Users/hlsfamily/Projects/ai/MyFirstAgent/src/.worktrees/ui-login", "branch": "wt/ui-login", "status": "active"}}
+{"event": "worktree.keep", "ts": 1776868129.119364, "task": {"id": 9}, "worktree": {"name": "ui-login", "path": "/Users/hlsfamily/Projects/ai/MyFirstAgent/src/.worktrees/ui-login", "status": "kept"}}
+{"event": "worktree.remove.before", "ts": 1776868149.326517, "task": {"id": 8}, "worktree": {"name": "auth-refactor", "path": "/Users/hlsfamily/Projects/ai/MyFirstAgent/src/.worktrees/auth-refactor"}}
+{"event": "task.completed", "ts": 1776868149.3873138, "task": {"id": 8, "status": "completed"}, "worktree": {"name": "auth-refactor"}}
+{"event": "worktree.remove.after", "ts": 1776868149.387476, "task": {"id": 8}, "worktree": {"name": "auth-refactor", "path": "/Users/hlsfamily/Projects/ai/MyFirstAgent/src/.worktrees/auth-refactor", "status": "removed"}}

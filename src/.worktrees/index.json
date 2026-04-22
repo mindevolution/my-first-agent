@@ -1,0 +1,22 @@
+{
+  "worktrees": [
+    {
+      "name": "auth-refactor",
+      "path": "/Users/hlsfamily/Projects/ai/MyFirstAgent/src/.worktrees/auth-refactor",
+      "branch": "wt/auth-refactor",
+      "task_id": 8,
+      "status": "removed",
+      "created_at": 1776868030.361557,
+      "removed_at": 1776868149.387404
+    },
+    {
+      "name": "ui-login",
+      "path": "/Users/hlsfamily/Projects/ai/MyFirstAgent/src/.worktrees/ui-login",
+      "branch": "wt/ui-login",
+      "task_id": 9,
+      "status": "kept",
+      "created_at": 1776868030.3925881,
+      "kept_at": 1776868129.118881
+    }
+  ]
+}

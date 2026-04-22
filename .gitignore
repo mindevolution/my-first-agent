@@ -29,3 +29,8 @@ ENV/
 # IDE
 .vscode/
 .idea/
+src/.worktrees/*/
+src/.tasks/*/
+src/.team/*/
+src/.transcripts/*/
+src/.task_outputs/*/
