@@ -108,6 +108,11 @@ TRANSCRIPT_DIR = WORKDIR / "src/.transcripts"
 TOOL_RESULTS_DIR = WORKDIR / "src/.task_outputs" / "tool-results"
 TASKS_DIR = WORKDIR / "src/.tasks"
 
+try:
+    LLM_REQUEST_TIMEOUT_SEC = max(5, int(os.environ.get("LLM_REQUEST_TIMEOUT_SEC", "45")))
+except ValueError:
+    LLM_REQUEST_TIMEOUT_SEC = 45
+
 # Auth
 dashscope.api_key = os.environ.get("DASHSCOPE_API_KEY")
 
@@ -331,6 +336,16 @@ class CompactState:
     recent_files: list[str] = field(default_factory=list)
 
 
+@dataclass
+class LocalLLMErrorResponse:
+    status_code: int
+    code: str
+    message: str
+    output: dict | None = None
+    request_id: str | None = None
+    usage: dict | None = None
+
+
 def estimate_context_size(messages: list) -> int:
     return len(str(messages))
 
@@ -540,6 +555,7 @@ def summarize_history(messages: list, *, show_progress: bool = True) -> str:
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 2000,
         "result_format": "message",
+        "request_timeout": LLM_REQUEST_TIMEOUT_SEC,
     }
     _log_llm_request(_compact_kw, context="compact_summary")
     if show_progress:
@@ -616,6 +632,7 @@ def _stream_generation_to_stdout(**call_kwargs):
     kwargs = dict(call_kwargs)
     kwargs["stream"] = True
     kwargs["incremental_output"] = True
+    kwargs.setdefault("request_timeout", LLM_REQUEST_TIMEOUT_SEC)
     log_ctx = kwargs.pop("_llm_log_context", None)
     show_progress = kwargs.pop("_llm_user_progress", False)
 
@@ -638,6 +655,22 @@ def _stream_generation_to_stdout(**call_kwargs):
                 _stderr_llm_done(log_ctx, None)
             _dashscope_ssl_hint()
             return None
+        except requests.exceptions.Timeout:
+            if show_progress:
+                _stderr_llm_done(log_ctx, None)
+            return LocalLLMErrorResponse(
+                status_code=408,
+                code="RequestTimeout",
+                message=f"Request timed out after {kwargs.get('request_timeout')}s",
+            )
+        except requests.exceptions.RequestException as e:
+            if show_progress:
+                _stderr_llm_done(log_ctx, None)
+            return LocalLLMErrorResponse(
+                status_code=503,
+                code="NetworkError",
+                message=str(e),
+            )
 
         try:
             for rsp in gen:
@@ -686,6 +719,7 @@ def _call_generation_nonstream(**call_kwargs):
     kwargs = dict(call_kwargs)
     kwargs["stream"] = False
     kwargs.pop("incremental_output", None)
+    kwargs.setdefault("request_timeout", LLM_REQUEST_TIMEOUT_SEC)
     log_ctx = kwargs.pop("_llm_log_context", None)
     show_progress = kwargs.pop("_llm_user_progress", False)
     tls_retried = False
@@ -705,6 +739,22 @@ def _call_generation_nonstream(**call_kwargs):
                 _stderr_llm_done(log_ctx, None)
             _dashscope_ssl_hint()
             return None
+        except requests.exceptions.Timeout:
+            if show_progress:
+                _stderr_llm_done(log_ctx, None)
+            return LocalLLMErrorResponse(
+                status_code=408,
+                code="RequestTimeout",
+                message=f"Request timed out after {kwargs.get('request_timeout')}s",
+            )
+        except requests.exceptions.RequestException as e:
+            if show_progress:
+                _stderr_llm_done(log_ctx, None)
+            return LocalLLMErrorResponse(
+                status_code=503,
+                code="NetworkError",
+                message=str(e),
+            )
         return rsp
 
 
